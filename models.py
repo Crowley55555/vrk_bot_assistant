@@ -25,9 +25,13 @@ class Product(BaseModel):
     old_price: Optional[str] = Field(None, description="Старая цена до акции")
     description: Optional[str] = Field(None, description="Текстовое описание со страницы товара")
     category: Optional[str] = Field(None, description="Категория / раздел каталога")
-    characteristics: dict[str, str] = Field(
+    raw_attrs: dict[str, str] = Field(
         default_factory=dict,
-        description="Характеристики (материал, размеры, место применения и т.д.)",
+        description="Все пары ключ-значение из блока характеристик (как на сайте)",
+    )
+    filters: dict[str, str] = Field(
+        default_factory=dict,
+        description="Нормализованные фильтры: material, location, product_type, size_group",
     )
     tags: list[str] = Field(
         default_factory=list,

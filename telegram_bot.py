@@ -4,8 +4,12 @@ Telegram-бот ООО "Завод ВРК" на aiogram 3.x.
 Отдельный асинхронный процесс, который подключается
 к единой бизнес-логике через process_message() из main.py.
 
-Все шаги воронки реализуются через Inline-кнопки (Callback queries).
-Reply-кнопка «Связаться с менеджером» доступна на любом этапе.
+Логика навигации:
+- /start → СРАЗУ главное меню (первый шаг воронки), без промежуточного экрана.
+  Приветственный текст устанавливается как описание бота (BotDescription),
+  он виден пользователю ДО первого нажатия «Start» в Telegram.
+- Первый шаг воронки = «Главное меню» → БЕЗ кнопок «Назад» / «Главное меню».
+- Все последующие шаги → С кнопками «◀️ Назад» и «🏠 Главное меню».
 """
 
 from __future__ import annotations
@@ -25,7 +29,13 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from config import MANAGER_CONTACTS, TELEGRAM_BOT_TOKEN, TELEGRAM_WELCOME_TEXT
+from config import (
+    FUNNEL_ORDER,
+    FUNNEL_STEPS_MAP,
+    MANAGER_CONTACTS,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_WELCOME_TEXT,
+)
 from logger import get_logger
 from main import process_message
 from models import ButtonOption, ChatAction, ChatRequest, ChatResponse
@@ -34,19 +44,21 @@ log = get_logger(__name__)
 
 router = Router()
 
-# Связка Telegram user_id → session_id для сохранения контекста
 _user_sessions: dict[int, str] = {}
+
+_NAV_ROW = [
+    InlineKeyboardButton(text="◀️ Назад", callback_data="__back__"),
+    InlineKeyboardButton(text="🏠 Главное меню", callback_data="__main_menu__"),
+]
 
 
 def _session_id(user_id: int) -> str:
-    """Возвращает (или создаёт) session_id для Telegram-пользователя."""
     if user_id not in _user_sessions:
         _user_sessions[user_id] = f"tg_{user_id}_{uuid.uuid4().hex[:8]}"
     return _user_sessions[user_id]
 
 
 def _reset_session(user_id: int) -> None:
-    """Сбрасывает сессию пользователя."""
     _user_sessions.pop(user_id, None)
 
 
@@ -61,13 +73,27 @@ _MAIN_KEYBOARD = ReplyKeyboardMarkup(
 
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 
-def _build_inline_keyboard(buttons: list[ButtonOption]) -> InlineKeyboardMarkup:
-    """Создаёт Inline-клавиатуру из списка кнопок ответа."""
+def _is_main_menu(response: ChatResponse) -> bool:
+    """Проверяет, является ли ответ главным меню (первый шаг воронки)."""
+    if not FUNNEL_ORDER:
+        return False
+    first_step = FUNNEL_STEPS_MAP.get(FUNNEL_ORDER[0])
+    return first_step is not None and response.reply == first_step["question"]
+
+
+def _build_inline_keyboard(
+    buttons: list[ButtonOption] | None = None,
+    with_nav: bool = True,
+) -> InlineKeyboardMarkup:
+    """Собирает Inline-клавиатуру с/без навигационных кнопок."""
     rows: list[list[InlineKeyboardButton]] = []
-    for btn in buttons:
-        rows.append([
-            InlineKeyboardButton(text=btn.label, callback_data=btn.value[:64])
-        ])
+    if buttons:
+        for btn in buttons:
+            rows.append([
+                InlineKeyboardButton(text=btn.label, callback_data=btn.value[:64])
+            ])
+    if with_nav:
+        rows.append(_NAV_ROW)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -89,32 +115,33 @@ async def _send_response(
     target: Message | CallbackQuery,
     response: ChatResponse,
 ) -> None:
-    """Отправляет ответ бота в Telegram-чат."""
-    chat_id = target.from_user.id if target.from_user else 0
+    """
+    Отправляет ответ бота в Telegram-чат.
 
-    # Если CallbackQuery — используем message.answer
+    Навигационные кнопки «Назад» / «Главное меню» добавляются
+    автоматически ко всем сообщениям, КРОМЕ главного меню (первый шаг воронки).
+    """
     if isinstance(target, CallbackQuery):
         send = target.message.answer
     else:
         send = target.answer
 
-    # Основной текст
     text = response.reply
 
-    # Inline-кнопки
-    inline_kb = None
-    if response.buttons:
-        inline_kb = _build_inline_keyboard(response.buttons)
-
-    # Карточка товара
     if response.action == ChatAction.SHOW_PRODUCT and response.product_data:
         card = _format_product_card(response.product_data)
         text = f"{text}\n\n{card}"
 
+    show_nav = not _is_main_menu(response)
+    inline_kb = _build_inline_keyboard(
+        response.buttons if response.buttons else None,
+        with_nav=show_nav,
+    )
+
     await send(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=inline_kb or _MAIN_KEYBOARD,
+        reply_markup=inline_kb,
     )
 
 
@@ -122,32 +149,44 @@ async def _send_response(
 
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
-    """Обработчик команды /start — приветствие."""
+    """/start → сразу главное меню (первый шаг воронки)."""
     _reset_session(message.from_user.id)
+    user_id = message.from_user.id
+    session = _session_id(user_id)
 
-    inline_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="▶️ Старт", callback_data="__start_funnel__")]
-        ]
-    )
-    await message.answer(
-        TELEGRAM_WELCOME_TEXT,
-        reply_markup=inline_kb,
-    )
+    # Установить reply-клавиатуру «📞 Связаться с менеджером»
     await message.answer(
         "Для связи с менеджером нажмите кнопку ниже ↓",
         reply_markup=_MAIN_KEYBOARD,
     )
 
+    # Сразу показать главное меню (первый шаг воронки)
+    request = ChatRequest(message="Старт", session_id=session, source="telegram")
+    response = await process_message(request)
+    await _send_response(message, response)
 
-@router.callback_query(F.data == "__start_funnel__")
-async def cb_start_funnel(callback: CallbackQuery) -> None:
-    """Нажатие Inline-кнопки «Старт» — начало воронки."""
+
+@router.callback_query(F.data == "__back__")
+async def cb_back(callback: CallbackQuery) -> None:
+    """«◀️ Назад» — возврат на предыдущий шаг воронки."""
     await callback.answer()
     user_id = callback.from_user.id
     session = _session_id(user_id)
 
-    request = ChatRequest(message="Старт", session_id=session, source="telegram")
+    request = ChatRequest(message="__back__", session_id=session, source="telegram")
+    response = await process_message(request)
+    await _send_response(callback, response)
+
+
+@router.callback_query(F.data == "__main_menu__")
+async def cb_main_menu(callback: CallbackQuery) -> None:
+    """«🏠 Главное меню» — сброс и возврат к первому шагу воронки."""
+    await callback.answer()
+    user_id = callback.from_user.id
+    _reset_session(user_id)
+    session = _session_id(user_id)
+
+    request = ChatRequest(message="__main_menu__", session_id=session, source="telegram")
     response = await process_message(request)
     await _send_response(callback, response)
 
@@ -175,7 +214,7 @@ async def msg_contact_manager(message: Message) -> None:
         f"📧 {MANAGER_CONTACTS['email']}\n"
         f"📍 {MANAGER_CONTACTS['address']}\n"
         f"🕐 {MANAGER_CONTACTS['work_hours']}",
-        reply_markup=_MAIN_KEYBOARD,
+        reply_markup=_build_inline_keyboard(with_nav=True),
     )
 
 
@@ -202,6 +241,13 @@ async def run_bot() -> None:
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+
+    # Приветственный текст → описание бота (экран первого запуска в Telegram)
+    try:
+        await bot.set_my_description(description=TELEGRAM_WELCOME_TEXT)
+        log.info("Описание бота установлено (экран первого запуска)")
+    except Exception as exc:
+        log.warning("Не удалось установить описание бота: %s", exc)
 
     log.info("Telegram-бот запущен (long-polling) …")
     try:

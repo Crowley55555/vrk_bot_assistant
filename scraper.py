@@ -2,12 +2,11 @@
 Умный парсер каталога ООО "Завод ВРК".
 
 - Обходит страницы категорий, собирает ссылки на карточки товаров.
-- Переходит на каждую карточку, извлекает полный набор данных.
-- Реализует инкрементальное обновление (Delta Update):
-  • новый товар → добавляет;
-  • изменённый → перезаписывает;
-  • без изменений → пропускает;
-  • исчезнувший → помечает / удаляет (если SCRAPER_REMOVE_MISSING=True).
+- Переходит на каждую карточку (Deep Crawl), извлекает полный набор данных,
+  включая ВСЕ пары ключ-значение из блока характеристик (card1_attrs).
+- Нормализует сырые характеристики в строгие фильтры (material, location,
+  product_type, size_group) для Metadata Filtering в ChromaDB.
+- Реализует инкрементальное обновление (Delta Update).
 """
 
 from __future__ import annotations
@@ -15,11 +14,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import random
 import re
 from typing import Optional
 
 import httpx
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from config import (
@@ -76,7 +76,8 @@ def _content_hash(product: Product) -> str:
         product.name,
         product.price or "",
         product.description or "",
-        json.dumps(product.characteristics, sort_keys=True, ensure_ascii=False),
+        json.dumps(product.raw_attrs, sort_keys=True, ensure_ascii=False),
+        json.dumps(product.filters, sort_keys=True, ensure_ascii=False),
     ])
     return hashlib.md5(blob.encode()).hexdigest()
 
@@ -88,60 +89,166 @@ def _abs_url(href: str) -> str:
     return BASE_SITE_URL.rstrip("/") + "/" + href.lstrip("/")
 
 
-# ─── Парсинг страницы категории ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# НОРМАЛИЗАЦИЯ АТРИБУТОВ → ФИЛЬТРЫ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_MATERIAL_METAL_KW = [
+    "нержавеющая сталь", "нержавейка", "оцинковка", "оцинкованная сталь",
+    "алюминий", "сталь", "металл", "латунь", "медь",
+]
+_MATERIAL_PLASTIC_KW = ["пластик", "пвх", "полипропилен", "abs", "полистирол"]
+_MATERIAL_WOOD_KW = ["дерево", "деревянный", "мдф", "шпон"]
+
+
+def _normalize_material(raw_value: str) -> str:
+    """Маппинг сырого значения материала в код фильтра."""
+    lower = raw_value.lower()
+    for kw in _MATERIAL_METAL_KW:
+        if kw in lower:
+            return "metal"
+    for kw in _MATERIAL_PLASTIC_KW:
+        if kw in lower:
+            return "plastic"
+    for kw in _MATERIAL_WOOD_KW:
+        if kw in lower:
+            return "wood"
+    return "unknown"
+
+
+_LOCATION_OUTDOOR_KW = [
+    "наружное", "наружный", "для фасада", "на фасад", "фасад",
+    "уличный", "с улицы", "улица",
+]
+_LOCATION_INDOOR_KW = [
+    "внутреннее", "внутренний", "для помещений", "помещение",
+    "внутрь", "в стены", "в потолок", "в пол",
+]
+
+
+def _normalize_location(raw_value: str) -> str:
+    """Маппинг места установки в код фильтра."""
+    lower = raw_value.lower()
+    for kw in _LOCATION_OUTDOOR_KW:
+        if kw in lower:
+            return "outdoor"
+    for kw in _LOCATION_INDOOR_KW:
+        if kw in lower:
+            return "indoor"
+    return "unknown"
+
+
+def _normalize_product_type(name: str, category: str | None) -> str:
+    """Определяет тип изделия по названию и категории."""
+    combined = (name + " " + (category or "")).lower()
+    if "диффузор" in combined:
+        return "diffuser"
+    if "клапан" in combined:
+        return "valve"
+    if any(w in combined for w in ("решетка", "решётка")):
+        return "grille"
+    if "воздухораспределител" in combined:
+        return "distributor"
+    if "электропривод" in combined:
+        return "actuator"
+    if any(w in combined for w in ("фильтр", "hepa")):
+        return "filter"
+    if "корзин" in combined:
+        return "ac_basket"
+    if "шумоглушител" in combined:
+        return "silencer"
+    return "other"
+
+
+_SIZE_RE = re.compile(r"(\d+)\s*[×хxXХ]\s*(\d+)")
+
+
+def _normalize_size_group(name: str, raw_attrs: dict[str, str]) -> str:
+    """Определяет размерную группу (small / large) по названию или характеристикам."""
+    search_text = name + " " + " ".join(raw_attrs.values())
+    m = _SIZE_RE.search(search_text)
+    if m:
+        max_side = max(int(m.group(1)), int(m.group(2)))
+        return "small" if max_side < 1000 else "large"
+    return "unknown"
+
+
+def _build_filters(raw_attrs: dict[str, str], name: str, category: str | None) -> dict[str, str]:
+    """
+    Собирает нормализованные фильтры из сырых характеристик товара.
+
+    Обрабатывает ВСЕ найденные характеристики, маппит ключевые поля
+    (Материал, Место применения) в строгие кодовые значения.
+    """
+    filters: dict[str, str] = {}
+
+    mat_raw = raw_attrs.get("Материал", "")
+    filters["material"] = _normalize_material(mat_raw) if mat_raw else "unknown"
+
+    loc_raw = raw_attrs.get("Место применения", "") or raw_attrs.get("Исполнение", "")
+    filters["location"] = _normalize_location(loc_raw) if loc_raw else "unknown"
+
+    filters["product_type"] = _normalize_product_type(name, category)
+    filters["size_group"] = _normalize_size_group(name, raw_attrs)
+
+    return filters
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ПАРСИНГ HTML
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Ссылка на товар: /catalog/{slug_категории}/{slug_товара}
+_PRODUCT_LINK_RE = re.compile(r"/catalog/[^/]+/[^/]+(?:\?|$|/)")
+
 
 def _parse_category_page(html: str, category_name: str) -> list[dict]:
     """
-    Из страницы категории извлекает базовую информацию по карточкам:
-    ссылку, название, артикул, цену, теги.
+    Из страницы категории собирает ссылки на карточки товаров (Deep Crawl).
+    Каждая ссылка станет отправной точкой для парсинга страницы товара.
     """
     soup = BeautifulSoup(html, "lxml")
     items: list[dict] = []
+    seen_urls: set[str] = set()
 
-    cards = soup.select(
-        ".product-card, "
-        ".catalog-item, "
-        "[class*='product'], "
-        "[class*='card'], "
-        "[data-product-id]"
-    )
-
-    if not cards:
-        # Если CSS-селекторы не сработали, ищем по структуре ссылок
-        links = soup.find_all("a", href=re.compile(r"/catalog/[^/]+/[^/]+"))
-        seen: set[str] = set()
-        for a_tag in links:
-            href = _abs_url(a_tag.get("href", ""))
-            if href in seen:
-                continue
-            seen.add(href)
-            name = _clean(a_tag.get_text())
-            if not name or len(name) < 3:
-                continue
-            items.append({"url": href, "name": name, "category": category_name})
-        return items
-
-    for card in cards:
-        link_tag = card.find("a", href=re.compile(r"/catalog/"))
-        if not link_tag:
+    for a_tag in soup.find_all("a", href=True):
+        href = (a_tag.get("href") or "").strip()
+        if not href or not _PRODUCT_LINK_RE.search(href):
             continue
-        url = _abs_url(link_tag.get("href", ""))
-        name = _clean(link_tag.get_text()) or _clean(card.find("h3", string=True) or "")
+        url = _abs_url(href)
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
 
-        art_tag = card.find(string=re.compile(r"(Арт\.|код:)\s*\d+"))
+        path = href.split("?")[0].rstrip("/")
+        if path.count("/") < 3:
+            continue
+
+        name = _clean(a_tag.get_text())
+        if not name or len(name) < 2:
+            name = _clean(a_tag.get("title")) or ""
+        if not name:
+            parent = a_tag.find_parent(["div", "article", "li"])
+            if parent:
+                name = _clean(parent.get_text())
+        if not name or len(name) < 2:
+            name = "Товар"
+
         article = ""
-        if art_tag:
-            m = re.search(r"(\d{3,})", str(art_tag))
-            if m:
-                article = m.group(1)
-
-        price_tag = card.find(string=re.compile(r"\d[\d\s]*₽|Р"))
-        price = _clean(str(price_tag)) if price_tag else None
-
+        price: Optional[str] = None
         tags: list[str] = []
-        for label in ("Хит", "Акция", "Советуем", "Новинка"):
-            if card.find(string=re.compile(label)):
-                tags.append(label)
+        card = a_tag.find_parent(["div", "article", "li", "section"])
+        if card:
+            card_text = card.get_text()
+            art_m = re.search(r"(?:Арт\.|код:)\s*(\d{3,})", card_text)
+            if art_m:
+                article = art_m.group(1)
+            price_m = re.search(r"(\d[\d\s]*\s*[₽Р]/шт|\d[\d\s]*\s*₽)", card_text)
+            if price_m:
+                price = _clean(price_m.group(1))
+            for label in ("Хит", "Акция", "Советуем", "Новинка"):
+                if label in card_text:
+                    tags.append(label)
 
         items.append({
             "url": url,
@@ -155,12 +262,71 @@ def _parse_category_page(html: str, category_name: str) -> list[dict]:
     return items
 
 
+# ─── Парсинг блока характеристик ───────────────────────────────────────────────
+
+def _parse_card_attrs(soup: BeautifulSoup) -> dict[str, str]:
+    """
+    Извлекает ВСЕ пары ключ-значение из блока характеристик товара.
+
+    Пробует три источника (в порядке приоритета):
+    1. div.card1_attrs_wrap — sidebar карточки
+    2. div.card_attrs — вкладка «Характеристики»
+    3. Текстовый поиск заголовка «Характеристики» — универсальный fallback
+
+    Количество пар может быть любым (2, 3, 5, …) — берём всё, что есть.
+    """
+    attrs: dict[str, str] = {}
+
+    # Способ 1: sidebar (card1_attrs_wrap > card1_attr)
+    wrap = soup.select_one("div.card1_attrs_wrap")
+    if wrap:
+        for row in wrap.select("div.card1_attr"):
+            key_el = row.select_one("span.card1_attr_title")
+            val_el = row.select_one("span.card1_attr_value")
+            if key_el and val_el:
+                k = _clean(key_el.get_text()).rstrip(":—– \t")
+                v = _clean(val_el.get_text())
+                if k and v:
+                    attrs[k] = v
+        if attrs:
+            return attrs
+
+    # Способ 2: вкладка (card_attrs > ul > li)
+    card_attrs_div = soup.select_one("div.card_attrs")
+    if card_attrs_div:
+        for li in card_attrs_div.select("ul li"):
+            key_el = li.select_one("div.attr_title")
+            val_el = li.select_one("div.attr_value")
+            if key_el and val_el:
+                k = _clean(key_el.get_text()).rstrip(":—– \t")
+                v = _clean(val_el.get_text())
+                if k and v:
+                    attrs[k] = v
+        if attrs:
+            return attrs
+
+    # Способ 3: универсальный fallback по тексту «Характеристики»
+    header = soup.find(string=re.compile(r"Характеристики", re.I))
+    if header:
+        parent = header.find_parent(["div", "section", "table"])
+        if parent:
+            for row in parent.find_all(["tr", "li", "div"]):
+                cells = row.find_all(["td", "th", "span", "dt", "dd"])
+                if len(cells) >= 2:
+                    k = _clean(cells[0].get_text()).rstrip(":—– \t")
+                    v = _clean(cells[1].get_text())
+                    if k and v and k.lower() != "характеристики":
+                        attrs[k] = v
+
+    return attrs
+
+
 # ─── Парсинг страницы товара ───────────────────────────────────────────────────
 
 def _parse_product_page(html: str, base_info: dict) -> Product:
     """
-    Со страницы товара извлекает полное описание и характеристики.
-    Дополняет базовую информацию из карточки категории.
+    Deep Crawl: со страницы товара извлекает полные данные,
+    включая все характеристики и нормализованные фильтры.
     """
     soup = BeautifulSoup(html, "lxml")
 
@@ -177,12 +343,11 @@ def _parse_product_page(html: str, base_info: dict) -> Product:
             if m:
                 article = m.group(1)
     if not article:
-        # Последний вариант — из URL
         m = re.search(r"-(\d+)$", base_info.get("url", ""))
         if m:
             article = m.group(1)
 
-    # Описание — все параграфы внутри блока описания
+    # Описание
     desc_parts: list[str] = []
     for section_title in ("Описание", "описание"):
         header = soup.find(string=re.compile(section_title, re.I))
@@ -199,35 +364,14 @@ def _parse_product_page(html: str, base_info: dict) -> Product:
             txt = _clean(p.get_text())
             if txt and len(txt) > 20:
                 desc_parts.append(txt)
-
     description = "\n".join(desc_parts) if desc_parts else None
 
-    # Характеристики
-    chars: dict[str, str] = {}
-    char_section = soup.find(string=re.compile(r"Характеристики", re.I))
-    if char_section:
-        parent = char_section.find_parent(["div", "section", "table"])
-        if parent:
-            rows = parent.find_all(["tr", "li", "div"])
-            for row in rows:
-                cells = row.find_all(["td", "th", "span", "dt", "dd"])
-                if len(cells) >= 2:
-                    key = _clean(cells[0].get_text())
-                    val = _clean(cells[1].get_text())
-                    if key and val and key.lower() != "характеристики":
-                        chars[key] = val
-    if not chars:
-        for keyword in ("Место применения", "Материал", "Конструкция", "Регулировка", "Форма"):
-            el = soup.find(string=re.compile(keyword))
-            if el:
-                parent = el.find_parent()
-                if parent:
-                    txt = _clean(parent.get_text())
-                    parts = txt.split(keyword, 1)
-                    if len(parts) == 2:
-                        val = parts[1].strip(" —:–\t\n")
-                        if val:
-                            chars[keyword] = val
+    # ── Характеристики (все пары ключ-значение) ──
+    raw_attrs = _parse_card_attrs(soup)
+
+    # ── Нормализованные фильтры ──
+    category = base_info.get("category", "")
+    filters = _build_filters(raw_attrs, name, category)
 
     # Цена
     price = base_info.get("price")
@@ -249,8 +393,9 @@ def _parse_product_page(html: str, base_info: dict) -> Product:
         price=price,
         old_price=old_price,
         description=description,
-        category=base_info.get("category"),
-        characteristics=chars,
+        category=category,
+        raw_attrs=raw_attrs,
+        filters=filters,
         tags=base_info.get("tags", []),
     )
     product.content_hash = _content_hash(product)
@@ -261,10 +406,10 @@ def _parse_product_page(html: str, base_info: dict) -> Product:
 
 async def scrape_all() -> list[Product]:
     """
-    Полный цикл парсинга:
+    Полный цикл Deep Crawl:
     1. Обходит все категории из START_URLS.
-    2. Собирает ссылки на карточки.
-    3. Загружает каждую карточку и извлекает данные.
+    2. Собирает ссылки на карточки товаров.
+    3. Загружает каждую карточку и извлекает данные + характеристики + фильтры.
     """
     all_products: dict[str, Product] = {}
 
@@ -287,13 +432,19 @@ async def scrape_all() -> list[Product]:
                 if url in all_products:
                     continue
 
-                await asyncio.sleep(SCRAPER_REQUEST_DELAY)
+                await asyncio.sleep(random.uniform(0.5, SCRAPER_REQUEST_DELAY))
 
                 try:
                     prod_html = await _fetch(client, url)
                     product = _parse_product_page(prod_html, info)
                     all_products[product.url] = product
-                    log.debug("  ✓ %s (арт. %s)", product.name, product.article)
+                    log.debug(
+                        "  ✓ %s (арт. %s) | фильтры: %s | attrs: %d шт.",
+                        product.name,
+                        product.article,
+                        product.filters,
+                        len(product.raw_attrs),
+                    )
                 except Exception as exc:
                     log.error("  Ошибка парсинга %s: %s", url, exc)
 
@@ -305,12 +456,20 @@ async def scrape_all() -> list[Product]:
 # ─── Delta Update ──────────────────────────────────────────────────────────────
 
 def _load_existing() -> dict[str, Product]:
-    """Загружает ранее сохранённые товары из JSON."""
+    """Загружает ранее сохранённые товары из JSON (с миграцией старого формата)."""
     if not RAW_PRODUCTS_PATH.exists():
         return {}
     try:
         data = json.loads(RAW_PRODUCTS_PATH.read_text(encoding="utf-8"))
-        return {p["url"]: Product(**p) for p in data}
+        products: dict[str, Product] = {}
+        for p in data:
+            if "characteristics" in p and "raw_attrs" not in p:
+                p["raw_attrs"] = p.pop("characteristics")
+            if "filters" not in p:
+                p["filters"] = {}
+            p.pop("characteristics", None)
+            products[p["url"]] = Product(**p)
+        return products
     except Exception as exc:
         log.warning("Не удалось загрузить %s: %s", RAW_PRODUCTS_PATH, exc)
         return {}
@@ -344,7 +503,6 @@ async def run_delta_update() -> dict[str, list[str]]:
         "unchanged": [],
     }
 
-    # Новые и изменённые
     for url, product in fresh_by_url.items():
         if url not in existing:
             report["added"].append(product.article)
@@ -353,13 +511,11 @@ async def run_delta_update() -> dict[str, list[str]]:
         else:
             report["unchanged"].append(product.article)
 
-    # Удалённые (исчезли с сайта)
     if SCRAPER_REMOVE_MISSING:
         for url in existing:
             if url not in fresh_by_url:
                 report["removed"].append(existing[url].article)
 
-    # Сохраняем актуальный набор
     _save_products(fresh_by_url)
 
     log.info(
@@ -379,18 +535,27 @@ def process_to_chunks(products: list[Product] | None = None) -> list[dict]:
     Превращает список товаров в текстовые чанки для ChromaDB.
 
     Каждый чанк содержит:
-    - id: уникальный идентификатор (article)
+    - id: уникальный идентификатор (артикул)
     - text: человекочитаемый текст для эмбеддинга
-    - metadata: структурированные поля для фильтрации
+    - metadata: нормализованные фильтры + служебные поля для where-clause
+
+    ТЕСТ: после запуска убедитесь, что в metadata каждого чанка
+    присутствуют ключи material, location, product_type, size_group.
     """
     if products is None:
         existing = _load_existing()
         products = list(existing.values())
 
     chunks: list[dict] = []
+    seen_articles: set[str] = set()
 
     for p in products:
-        chars_text = "; ".join(f"{k}: {v}" for k, v in p.characteristics.items())
+        if p.article in seen_articles:
+            continue
+        seen_articles.add(p.article)
+
+        # Текст чанка для семантического поиска
+        attrs_text = "; ".join(f"{k}: {v}" for k, v in p.raw_attrs.items())
 
         text_parts = [
             f"Название: {p.name}",
@@ -400,26 +565,29 @@ def process_to_chunks(products: list[Product] | None = None) -> list[dict]:
             text_parts.append(f"Категория: {p.category}")
         if p.price:
             text_parts.append(f"Цена: {p.price}")
-        if chars_text:
-            text_parts.append(f"Характеристики: {chars_text}")
+        if attrs_text:
+            text_parts.append(f"Характеристики: {attrs_text}")
         if p.description:
             text_parts.append(f"Описание: {p.description[:1500]}")
         text_parts.append(f"Ссылка: {p.url}")
 
+        # Метаданные: нормализованные фильтры + служебные поля
+        metadata: dict[str, str] = {
+            "article": p.article,
+            "name": p.name,
+            "category": p.category or "",
+            "price": p.price or "",
+            "url": p.url,
+            "tags": ", ".join(p.tags),
+        }
+        metadata.update(p.filters)
+        metadata["raw_attrs_json"] = json.dumps(p.raw_attrs, ensure_ascii=False)
+
         chunks.append({
             "id": p.article,
             "text": "\n".join(text_parts),
-            "metadata": {
-                "article": p.article,
-                "name": p.name,
-                "category": p.category or "",
-                "price": p.price or "",
-                "url": p.url,
-                "material": p.characteristics.get("Материал", ""),
-                "location": p.characteristics.get("Место применения", ""),
-                "tags": ", ".join(p.tags),
-            },
+            "metadata": metadata,
         })
 
-    log.info("Создано %d чанков для векторной БД", len(chunks))
+    log.info("Создано %d чанков для векторной БД (дедуплицировано)", len(chunks))
     return chunks

@@ -57,19 +57,34 @@ def get_collection() -> chromadb.Collection:
 def index_chunks(chunks: list[dict]) -> int:
     """
     Добавляет / обновляет чанки в коллекции (upsert).
+    Дедуплицирует по ID перед отправкой в ChromaDB.
     Возвращает количество обработанных документов.
     """
     if not chunks:
         log.warning("index_chunks: пустой список чанков")
         return 0
 
+    # Дедупликация: если несколько чанков с одинаковым ID — оставляем первый
+    seen: dict[str, int] = {}
+    unique_chunks: list[dict] = []
+    for chunk in chunks:
+        cid = chunk["id"]
+        if cid not in seen:
+            seen[cid] = len(unique_chunks)
+            unique_chunks.append(chunk)
+
+    if len(unique_chunks) < len(chunks):
+        log.warning(
+            "index_chunks: убрано %d дубликатов ID",
+            len(chunks) - len(unique_chunks),
+        )
+
     col = get_collection()
 
-    ids = [c["id"] for c in chunks]
-    documents = [c["text"] for c in chunks]
-    metadatas = [c["metadata"] for c in chunks]
+    ids = [c["id"] for c in unique_chunks]
+    documents = [c["text"] for c in unique_chunks]
+    metadatas = [c["metadata"] for c in unique_chunks]
 
-    # ChromaDB upsert: обновит существующие, добавит новые
     col.upsert(ids=ids, documents=documents, metadatas=metadatas)
     log.info("ChromaDB: upsert %d документов", len(ids))
     return len(ids)
@@ -110,10 +125,14 @@ def search(
         id, text, metadata, distance
     """
     col = get_collection()
+    total = col.count()
+    if total == 0:
+        log.warning("ChromaDB: коллекция пуста, поиск невозможен")
+        return []
 
     kwargs: dict = {
         "query_texts": [query],
-        "n_results": min(n_results, col.count() or 1),
+        "n_results": min(n_results, total),
     }
     if where:
         kwargs["where"] = where
@@ -122,7 +141,15 @@ def search(
         results = col.query(**kwargs)
     except Exception as exc:
         log.error("ChromaDB: ошибка поиска — %s", exc)
-        return []
+        if where:
+            log.info("ChromaDB: повтор поиска без фильтров")
+            try:
+                kwargs.pop("where", None)
+                results = col.query(**kwargs)
+            except Exception:
+                return []
+        else:
+            return []
 
     items: list[dict] = []
     if results and results["ids"]:

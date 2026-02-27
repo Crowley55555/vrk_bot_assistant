@@ -2,13 +2,46 @@
 FastAPI-бэкенд бота-консультанта ООО "Завод ВРК".
 
 Реализует:
-- RAG-поиск по векторной базе товаров.
-- Воронку продаж (State Machine) с хранением контекста по session_id.
+- RAG-поиск по векторной базе товаров с **Metadata Filtering**.
+- Воронку продаж (State Machine) с накоплением активных фильтров.
 - Единый эндпоинт /api/chat для веб-виджета и Telegram.
+
+При прохождении воронки каждый ответ пользователя маппится в filter_value,
+который затем используется в ChromaDB where-clause для точной фильтрации.
+
+─── ИНСТРУКЦИЯ ПО ТЕСТИРОВАНИЮ METADATA FILTERING ─────────────────────────────
+
+1. Запустить парсер:
+       python scheduler.py
+   Убедиться, что в data/raw_products.json у товаров появились поля:
+       "raw_attrs": {"Место применения": "На фасад", "Материал": "Алюминий", ...}
+       "filters":   {"material": "metal", "location": "outdoor", ...}
+
+2. Запустить бэкенд:
+       uvicorn main:app --host 127.0.0.1 --port 8080 --reload
+
+3. Пройти воронку через Telegram-бота или API:
+   - Нажать «Старт»
+   - Выбрать «Вентиляционные решетки» (grille)
+   - Выбрать «Фасад / Улица» (outdoor)
+   - Выбрать «Металл» (metal)
+   - Выбрать размер
+
+4. Проверить в логах (logs/bot.log):
+   - Строку «Воронка завершена | filters=...» — должны быть выбранные фильтры
+   - В результатах поиска ТОЛЬКО товары с location=outdoor.
+     Товары с location=indoor должны быть ПОЛНОСТЬЮ ИСКЛЮЧЕНЫ.
+
+5. Тест fallback: Если строгий фильтр вернул 0 результатов,
+   система автоматически ослабит фильтры (уберёт менее важные) и повторит поиск.
+   В логах появится строка «Fallback: убран фильтр '...'».
+───────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
+import json
+import re
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -22,6 +55,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from config import (
     FUNNEL_ORDER,
     FUNNEL_STEPS,
+    FUNNEL_STEPS_MAP,
     MANAGER_CONTACTS,
     STATIC_DIR,
     SYSTEM_PROMPT,
@@ -37,9 +71,9 @@ log = get_logger(__name__)
 # ─── Хранилище сессий (in-memory) ─────────────────────────────────────────────
 
 _sessions: dict[str, dict[str, Any]] = defaultdict(lambda: {
-    "funnel_step": None,    # None = свободный режим, str = текущий шаг воронки
-    "funnel_data": {},      # собранные ответы воронки
-    "history": [],          # история сообщений LangChain
+    "funnel_step": None,       # None = свободный режим, str = текущий step_id
+    "active_filters": {},      # step_id -> filter_value (накопленные фильтры)
+    "history": [],             # история сообщений LangChain
 })
 
 
@@ -50,7 +84,21 @@ def _get_session(session_id: str) -> dict[str, Any]:
 def _reset_funnel(session_id: str) -> None:
     s = _get_session(session_id)
     s["funnel_step"] = None
-    s["funnel_data"] = {}
+    s["active_filters"] = {}
+
+
+def _goto_main_menu(session_id: str) -> ChatResponse:
+    """Сбрасывает воронку и возвращает первый шаг (= главное меню)."""
+    _reset_funnel(session_id)
+    session = _get_session(session_id)
+    first_step_id = FUNNEL_ORDER[0]
+    session["funnel_step"] = first_step_id
+    step_config = FUNNEL_STEPS_MAP[first_step_id]
+    return ChatResponse(
+        reply=step_config["question"],
+        action=ChatAction.ASK_QUESTION,
+        buttons=_make_buttons(step_config),
+    )
 
 
 # ─── Lifespan (запуск/остановка) ───────────────────────────────────────────────
@@ -59,19 +107,16 @@ def _reset_funnel(session_id: str) -> None:
 async def lifespan(app: FastAPI):
     log.info("Запуск FastAPI-бэкенда …")
 
-    # Проверяем наличие LLM (при старте)
     try:
         get_llm()
     except RuntimeError as exc:
         log.critical(str(exc))
 
-    # Проверяем / создаём коллекцию ChromaDB
     col = get_collection()
     if col.count() == 0:
         log.info("ChromaDB пуста — попытка индексации из raw_products.json …")
         reindex_all()
 
-    # Планировщик
     sched = start_scheduler()
 
     yield
@@ -84,7 +129,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Бот-консультант ВРК",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -107,8 +152,43 @@ def _build_context(results: list[dict]) -> str:
         return "В базе знаний ничего не найдено по данному запросу."
     parts = []
     for i, r in enumerate(results, 1):
-        parts.append(f"--- Товар {i} ---\n{r['text']}")
+        meta = r.get("metadata", {})
+        raw_json = meta.get("raw_attrs_json", "{}")
+        try:
+            raw_attrs = json.loads(raw_json)
+        except (json.JSONDecodeError, TypeError):
+            raw_attrs = {}
+        attrs_str = ", ".join(f"{k}: {v}" for k, v in raw_attrs.items()) if raw_attrs else "нет данных"
+        parts.append(
+            f"--- Товар {i} ---\n{r['text']}\n"
+            f"Фильтры: material={meta.get('material','?')}, "
+            f"location={meta.get('location','?')}, "
+            f"product_type={meta.get('product_type','?')}, "
+            f"size_group={meta.get('size_group','?')}\n"
+            f"Характеристики с сайта: {attrs_str}"
+        )
     return "\n\n".join(parts)
+
+
+def _format_active_filters(session_id: str) -> str:
+    """Строковое представление активных фильтров для системного промпта."""
+    session = _get_session(session_id)
+    active = session.get("active_filters", {})
+    if not active:
+        return "Не заданы (свободный режим)"
+    parts = []
+    for step_id, value in active.items():
+        if value:
+            step_config = FUNNEL_STEPS_MAP.get(step_id, {})
+            label = value
+            for opt in step_config.get("options", []):
+                if opt["filter_value"] == value:
+                    label = f"{opt['label']} ({value})"
+                    break
+            parts.append(f"{step_id}: {label}")
+        else:
+            parts.append(f"{step_id}: не важно")
+    return ", ".join(parts) if parts else "Все фильтры пропущены"
 
 
 async def _ask_llm(
@@ -116,15 +196,16 @@ async def _ask_llm(
     session_id: str,
     context: str,
 ) -> str:
-    """Отправляет запрос к LLM с контекстом и историей."""
+    """Отправляет запрос к LLM с контекстом, фильтрами и историей."""
     llm = get_llm()
     session = _get_session(session_id)
 
-    system_msg = SystemMessage(content=SYSTEM_PROMPT.format(context=context))
+    filters_text = _format_active_filters(session_id)
+    system_msg = SystemMessage(
+        content=SYSTEM_PROMPT.format(context=context, active_filters=filters_text)
+    )
 
-    # Ограничиваем историю последними 10 парами
     history = session["history"][-20:]
-
     messages = [system_msg] + history + [HumanMessage(content=user_message)]
 
     try:
@@ -143,7 +224,7 @@ async def _ask_llm(
     return answer
 
 
-# ─── Логика воронки ────────────────────────────────────────────────────────────
+# ─── Логика воронки с фильтрами ───────────────────────────────────────────────
 
 def _is_start_funnel(message: str) -> bool:
     """Определяет, что пользователь хочет начать подбор."""
@@ -169,42 +250,77 @@ def _is_contact_request(message: str) -> bool:
 def _next_funnel_step(session_id: str) -> str | None:
     """Определяет следующий шаг воронки, который ещё не заполнен."""
     session = _get_session(session_id)
-    filled = session["funnel_data"]
-    for step_key in FUNNEL_ORDER:
-        if step_key not in filled:
-            return step_key
+    completed = session["active_filters"]
+    for step_id in FUNNEL_ORDER:
+        if step_id not in completed:
+            return step_id
     return None
 
 
 def _handle_funnel_answer(session_id: str, answer: str) -> None:
-    """Сохраняет ответ клиента на текущий шаг воронки."""
+    """
+    Маппит ответ пользователя в filter_value и сохраняет в active_filters.
+
+    Ищет совпадение по filter_value или label в опциях текущего шага.
+    """
     session = _get_session(session_id)
     current_step = session["funnel_step"]
-    if current_step:
-        session["funnel_data"][current_step] = answer
+    if not current_step:
+        return
+
+    step_config = FUNNEL_STEPS_MAP.get(current_step)
+    if not step_config:
+        return
+
+    filter_value = ""
+    for opt in step_config["options"]:
+        if opt["filter_value"] == answer or opt["label"] == answer:
+            filter_value = opt["filter_value"]
+            break
+
+    session["active_filters"][current_step] = filter_value
+
+
+def _make_buttons(step_config: dict) -> list[ButtonOption]:
+    """Создаёт список кнопок для шага воронки."""
+    return [
+        ButtonOption(
+            label=opt["label"],
+            value=opt["filter_value"] if opt["filter_value"] else opt["label"],
+        )
+        for opt in step_config["options"]
+    ]
 
 
 def _build_search_query(session_id: str) -> str:
-    """Формирует поисковый запрос из накопленных данных воронки."""
+    """Формирует текстовый поисковый запрос из выбранных фильтров."""
     session = _get_session(session_id)
     parts = []
-    for key, val in session["funnel_data"].items():
-        step_conf = FUNNEL_STEPS.get(key, {})
-        question = step_conf.get("question", key)
-        parts.append(f"{question}: {val}")
-    return " ".join(parts)
+    for step_id, value in session["active_filters"].items():
+        if not value:
+            continue
+        step_config = FUNNEL_STEPS_MAP.get(step_id)
+        if step_config:
+            for opt in step_config["options"]:
+                if opt["filter_value"] == value:
+                    parts.append(opt["label"])
+                    break
+    return " ".join(parts) if parts else "вентиляционное оборудование"
 
 
 def _build_where_filter(session_id: str) -> dict | None:
-    """Формирует фильтр метаданных ChromaDB из данных воронки."""
+    """
+    Формирует ChromaDB where-clause из накопленных active_filters.
+
+    Пустые значения (filter_value == "") пропускаются — частичная фильтрация.
+    """
     session = _get_session(session_id)
-    data = session["funnel_data"]
+    active = session["active_filters"]
     conditions: list[dict] = []
 
-    if "material" in data and data["material"] != "Не важно":
-        conditions.append({"material": {"$contains": data["material"]}})
-    if "location" in data and data["location"] != "Другое / не уверен":
-        conditions.append({"location": {"$contains": data["location"].split("(")[0].strip()}})
+    for key, value in active.items():
+        if value:
+            conditions.append({key: {"$eq": value}})
 
     if not conditions:
         return None
@@ -213,15 +329,225 @@ def _build_where_filter(session_id: str) -> dict | None:
     return {"$and": conditions}
 
 
+def _search_with_fallback(
+    query: str,
+    session_id: str,
+    n_results: int = 5,
+) -> list[dict]:
+    """
+    Поиск с прогрессивным ослаблением фильтров.
+
+    Если строгий поиск (все фильтры) не дал результатов,
+    последовательно убираем менее важные фильтры (от конца FUNNEL_ORDER).
+    """
+    where_filter = _build_where_filter(session_id)
+    results = search(query, n_results=n_results, where=where_filter)
+    if results:
+        return results
+
+    session = _get_session(session_id)
+    active = {k: v for k, v in session["active_filters"].items() if v}
+
+    for key_to_relax in reversed(FUNNEL_ORDER):
+        if key_to_relax in active:
+            active.pop(key_to_relax)
+            conditions = [{k: {"$eq": v}} for k, v in active.items()]
+            relaxed_where = None
+            if len(conditions) == 1:
+                relaxed_where = conditions[0]
+            elif len(conditions) > 1:
+                relaxed_where = {"$and": conditions}
+
+            results = search(query, n_results=n_results, where=relaxed_where)
+            if results:
+                log.info(
+                    "Fallback: убран фильтр '%s', найдено %d результатов",
+                    key_to_relax, len(results),
+                )
+                return results
+
+    return search(query, n_results=n_results)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# УМНЫЙ АНАЛИЗ СВОБОДНОГО ТЕКСТА
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SIZE_RE = re.compile(r"(\d+)\s*[×хxXХ]\s*(\d+)")
+
+
+def _extract_filters_from_text(text: str) -> dict[str, str]:
+    """
+    Извлекает фильтры из произвольного текста пользователя.
+
+    Пример: «подбери решетку для квартиры в потолок 300х500»
+    → {"product_type": "grille", "location": "indoor", "size_group": "small"}
+
+    Возвращает только те фильтры, которые удалось уверенно определить.
+    """
+    lower = text.lower()
+    filters: dict[str, str] = {}
+
+    # product_type
+    if any(w in lower for w in ("решетк", "решётк")):
+        filters["product_type"] = "grille"
+    elif "диффузор" in lower:
+        filters["product_type"] = "diffuser"
+    elif "клапан" in lower:
+        filters["product_type"] = "valve"
+    elif any(w in lower for w in ("воздухораспределител", "воздухораздат")):
+        filters["product_type"] = "distributor"
+    elif any(w in lower for w in ("электропривод", "привод")):
+        filters["product_type"] = "actuator"
+    elif any(w in lower for w in ("фильтр", "hepa")):
+        filters["product_type"] = "filter"
+
+    # location
+    if any(w in lower for w in (
+        "фасад", "улиц", "наружн", "уличн", "снаружи", "внешн",
+    )):
+        filters["location"] = "outdoor"
+    elif any(w in lower for w in (
+        "помещен", "внутр", "квартир", "офис", "потолок", "потолоч",
+        "стен", "комнат", "дом", "кухн", "ванн", "туалет",
+        "в пол", "наполн", "межкомнат", "переточн",
+    )):
+        filters["location"] = "indoor"
+
+    # material
+    if any(w in lower for w in (
+        "металл", "сталь", "стальн", "алюмини", "нержавейк",
+        "нержавеющ", "оцинков", "железн", "латун",
+    )):
+        filters["material"] = "metal"
+    elif any(w in lower for w in ("пластик", "пластмасс", "пвх", "полипропилен")):
+        filters["material"] = "plastic"
+    elif any(w in lower for w in ("дерев", "деревянн", "мдф", "шпон")):
+        filters["material"] = "wood"
+
+    # size_group
+    m = _SIZE_RE.search(text)
+    if m:
+        max_side = max(int(m.group(1)), int(m.group(2)))
+        filters["size_group"] = "small" if max_side < 1000 else "large"
+    elif any(w in lower for w in ("маленьк", "небольш", "компактн", "мини")):
+        filters["size_group"] = "small"
+    elif any(w in lower for w in ("больш", "крупн", "промышленн")):
+        filters["size_group"] = "large"
+
+    return filters
+
+
+def _is_known_option(message: str) -> bool:
+    """Проверяет, совпадает ли сообщение с одной из кнопок воронки."""
+    for step in FUNNEL_STEPS:
+        for opt in step["options"]:
+            if opt["filter_value"] == message or opt["label"] == message:
+                return True
+    return False
+
+
+def _describe_extracted(extracted: dict[str, str]) -> str:
+    """Формирует человекочитаемое описание извлечённых фильтров."""
+    parts: list[str] = []
+    for step_id, value in extracted.items():
+        step_config = FUNNEL_STEPS_MAP.get(step_id)
+        if step_config:
+            for opt in step_config["options"]:
+                if opt["filter_value"] == value:
+                    parts.append(opt["label"])
+                    break
+            else:
+                parts.append(value)
+    return ", ".join(parts)
+
+
+def _best_product_data(results: list[dict]) -> dict | None:
+    """Извлекает данные лучшего товара из результатов поиска."""
+    if not results:
+        return None
+    best = results[0]["metadata"]
+    return {
+        "name": best.get("name", ""),
+        "article": best.get("article", ""),
+        "price": best.get("price", ""),
+        "url": best.get("url", ""),
+        "category": best.get("category", ""),
+        "material": best.get("material", ""),
+        "location": best.get("location", ""),
+    }
+
+
+async def _do_filtered_search(
+    session_id: str,
+    user_message: str,
+) -> ChatResponse:
+    """Выполняет поиск с текущими active_filters и формирует ответ через LLM."""
+    session = _get_session(session_id)
+    search_query = user_message or _build_search_query(session_id)
+    results = _search_with_fallback(search_query, session_id)
+
+    log.info(
+        "Поиск с фильтрами | filters=%s | query='%s' | results=%d",
+        session["active_filters"],
+        search_query[:80],
+        len(results),
+    )
+
+    context = _build_context(results)
+    llm_answer = await _ask_llm(
+        f"Клиент ищет: {search_query}. Подбери подходящие товары из контекста.",
+        session_id,
+        context,
+    )
+
+    product_data = _best_product_data(results)
+    _reset_funnel(session_id)
+
+    return ChatResponse(
+        reply=llm_answer,
+        action=ChatAction.SHOW_PRODUCT if product_data else ChatAction.CONTACT_MANAGER,
+        product_data=product_data,
+    )
+
+
 # ─── Главный обработчик ───────────────────────────────────────────────────────
 
 async def process_message(request: ChatRequest) -> ChatResponse:
-    """Единая бизнес-логика обработки сообщения (веб + телеграм)."""
+    """
+    Единая бизнес-логика обработки сообщения (веб + телеграм).
+
+    Поддерживает три режима ввода:
+    1. Нажатие кнопки — классический проход по воронке.
+    2. Свободный текст с описанием товара — извлечение фильтров из текста,
+       автозаполнение известных параметров, уточнение недостающих.
+    3. Вопрос не о товаре — RAG-ответ без фильтрации.
+    """
     session_id = request.session_id
     message = request.message.strip()
     session = _get_session(session_id)
 
-    # --- Запрос связи с менеджером ---
+    # ── Навигация ──
+    if message == "__main_menu__":
+        return _goto_main_menu(session_id)
+
+    if message == "__back__":
+        current_step = session["funnel_step"]
+        if current_step and current_step in FUNNEL_ORDER:
+            idx = FUNNEL_ORDER.index(current_step)
+            if idx > 0:
+                prev_step_id = FUNNEL_ORDER[idx - 1]
+                session["active_filters"].pop(prev_step_id, None)
+                session["funnel_step"] = prev_step_id
+                step_config = FUNNEL_STEPS_MAP[prev_step_id]
+                return ChatResponse(
+                    reply=step_config["question"],
+                    action=ChatAction.ASK_QUESTION,
+                    buttons=_make_buttons(step_config),
+                )
+        return _goto_main_menu(session_id)
+
+    # ── Связь с менеджером ──
     if _is_contact_request(message):
         _reset_funnel(session_id)
         return ChatResponse(
@@ -235,87 +561,71 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             action=ChatAction.CONTACT_MANAGER,
         )
 
-    # --- Начало воронки ---
-    if _is_start_funnel(message) and session["funnel_step"] is None:
-        session["funnel_step"] = FUNNEL_ORDER[0]
-        session["funnel_data"] = {}
-        step = FUNNEL_STEPS[FUNNEL_ORDER[0]]
-        buttons = [
-            ButtonOption(label=opt, value=opt) for opt in step["options"]
-        ]
-        return ChatResponse(
-            reply=step["question"],
-            action=ChatAction.ASK_QUESTION,
-            buttons=buttons,
-        )
-
-    # --- Продолжение воронки ---
-    if session["funnel_step"] is not None:
-        _handle_funnel_answer(session_id, message)
+    # ── Нажатие кнопки воронки (точное совпадение) ──
+    if _is_known_option(message):
+        if session["funnel_step"] is not None:
+            _handle_funnel_answer(session_id, message)
+        else:
+            for step in FUNNEL_STEPS:
+                for opt in step["options"]:
+                    if opt["filter_value"] == message or opt["label"] == message:
+                        session["active_filters"][step["step_id"]] = opt["filter_value"]
+                        break
 
         next_step = _next_funnel_step(session_id)
         if next_step:
             session["funnel_step"] = next_step
-            step = FUNNEL_STEPS[next_step]
-            buttons = [
-                ButtonOption(label=opt, value=opt) for opt in step["options"]
-            ]
+            step_config = FUNNEL_STEPS_MAP[next_step]
             return ChatResponse(
-                reply=step["question"],
+                reply=step_config["question"],
                 action=ChatAction.ASK_QUESTION,
-                buttons=buttons,
+                buttons=_make_buttons(step_config),
             )
+        return await _do_filtered_search(session_id, _build_search_query(session_id))
 
-        # Воронка завершена — поиск товара
-        search_query = _build_search_query(session_id)
-        where_filter = _build_where_filter(session_id)
-        results = search(search_query, n_results=5, where=where_filter)
+    # ── Извлечение фильтров из свободного текста ──
+    extracted = _extract_filters_from_text(message)
 
-        if not results:
-            results = search(search_query, n_results=5)
+    if extracted:
+        for key, value in extracted.items():
+            session["active_filters"][key] = value
 
-        context = _build_context(results)
-        llm_answer = await _ask_llm(
-            f"Клиент ищет: {search_query}. Подбери подходящие товары из контекста.",
-            session_id,
-            context,
-        )
+        next_step = _next_funnel_step(session_id)
+        if next_step:
+            session["funnel_step"] = next_step
+            step_config = FUNNEL_STEPS_MAP[next_step]
+            understood = _describe_extracted(extracted)
+            prefix = f"✅ Понял: {understood}.\n\n" if understood else ""
+            return ChatResponse(
+                reply=prefix + step_config["question"],
+                action=ChatAction.ASK_QUESTION,
+                buttons=_make_buttons(step_config),
+            )
+        return await _do_filtered_search(session_id, message)
 
-        product_data = None
-        if results:
-            best = results[0]["metadata"]
-            product_data = {
-                "name": best.get("name", ""),
-                "article": best.get("article", ""),
-                "price": best.get("price", ""),
-                "url": best.get("url", ""),
-                "category": best.get("category", ""),
-            }
+    # ── Триггеры начала воронки (без фильтров в тексте) ──
+    if _is_start_funnel(message) and session["funnel_step"] is None:
+        return _goto_main_menu(session_id)
 
-        _reset_funnel(session_id)
-
-        return ChatResponse(
-            reply=llm_answer,
-            action=ChatAction.SHOW_PRODUCT if product_data else ChatAction.CONTACT_MANAGER,
-            product_data=product_data,
-        )
-
-    # --- Свободный вопрос (RAG) ---
+    # ── Свободный вопрос (RAG) ──
+    # Если пользователь в воронке, но написал вопрос не по теме подбора —
+    # отвечаем через RAG и показываем текущий шаг воронки для продолжения.
     results = search(message, n_results=5)
     context = _build_context(results)
     llm_answer = await _ask_llm(message, session_id, context)
 
+    if session["funnel_step"] is not None:
+        step_config = FUNNEL_STEPS_MAP[session["funnel_step"]]
+        return ChatResponse(
+            reply=llm_answer + f"\n\n{step_config['question']}",
+            action=ChatAction.ASK_QUESTION,
+            buttons=_make_buttons(step_config),
+        )
+
     product_data = None
     action = ChatAction.ASK_QUESTION
     if results and results[0]["distance"] < 0.7:
-        best = results[0]["metadata"]
-        product_data = {
-            "name": best.get("name", ""),
-            "article": best.get("article", ""),
-            "price": best.get("price", ""),
-            "url": best.get("url", ""),
-            "category": best.get("category", ""),
-        }
+        product_data = _best_product_data(results)
         action = ChatAction.SHOW_PRODUCT
 
     return ChatResponse(
