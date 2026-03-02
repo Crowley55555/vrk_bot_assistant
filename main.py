@@ -2,47 +2,16 @@
 FastAPI-бэкенд бота-консультанта ООО "Завод ВРК".
 
 Реализует:
-- RAG-поиск по векторной базе товаров с **Metadata Filtering**.
-- Воронку продаж (State Machine) с накоплением активных фильтров.
+- Динамическую воронку (Dynamic Funnel) со Smart Routing для решеток.
+- RAG-поиск с Metadata Filtering + sub_category и валидацией.
+- Умный анализ свободного текста.
 - Единый эндпоинт /api/chat для веб-виджета и Telegram.
-
-При прохождении воронки каждый ответ пользователя маппится в filter_value,
-который затем используется в ChromaDB where-clause для точной фильтрации.
-
-─── ИНСТРУКЦИЯ ПО ТЕСТИРОВАНИЮ METADATA FILTERING ─────────────────────────────
-
-1. Запустить парсер:
-       python scheduler.py
-   Убедиться, что в data/raw_products.json у товаров появились поля:
-       "raw_attrs": {"Место применения": "На фасад", "Материал": "Алюминий", ...}
-       "filters":   {"material": "metal", "location": "outdoor", ...}
-
-2. Запустить бэкенд:
-       uvicorn main:app --host 127.0.0.1 --port 8080 --reload
-
-3. Пройти воронку через Telegram-бота или API:
-   - Нажать «Старт»
-   - Выбрать «Вентиляционные решетки» (grille)
-   - Выбрать «Фасад / Улица» (outdoor)
-   - Выбрать «Металл» (metal)
-   - Выбрать размер
-
-4. Проверить в логах (logs/bot.log):
-   - Строку «Воронка завершена | filters=...» — должны быть выбранные фильтры
-   - В результатах поиска ТОЛЬКО товары с location=outdoor.
-     Товары с location=indoor должны быть ПОЛНОСТЬЮ ИСКЛЮЧЕНЫ.
-
-5. Тест fallback: Если строгий фильтр вернул 0 результатов,
-   система автоматически ослабит фильтры (уберёт менее важные) и повторит поиск.
-   В логах появится строка «Fallback: убран фильтр '...'».
-───────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
 import json
 import re
-import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Any
@@ -53,11 +22,13 @@ from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from config import (
-    FUNNEL_ORDER,
-    FUNNEL_STEPS,
-    FUNNEL_STEPS_MAP,
+    FUNNEL_SCENARIOS,
+    GRILLE_FEATURE_LABELS,
+    GRILLE_MOUNT_OPTIONS,
     MANAGER_CONTACTS,
+    PRODUCT_TYPE_STEP,
     STATIC_DIR,
+    SUBCATEGORY_RULES,
     SYSTEM_PROMPT,
 )
 from llm_factory import get_llm
@@ -68,12 +39,18 @@ from vector_store import get_collection, reindex_all, search
 
 log = get_logger(__name__)
 
-# ─── Хранилище сессий (in-memory) ─────────────────────────────────────────────
+# ─── Хранилище сессий ─────────────────────────────────────────────────────────
 
 _sessions: dict[str, dict[str, Any]] = defaultdict(lambda: {
-    "funnel_step": None,       # None = свободный режим, str = текущий step_id
-    "active_filters": {},      # step_id -> filter_value (накопленные фильтры)
-    "history": [],             # история сообщений LangChain
+    "funnel_phase": None,       # None | "product_type" | "scenario"
+    "scenario_key": None,
+    "step_idx": 0,
+    "active_filters": {},
+    "history": [],
+    # Smart Routing (grille)
+    "grille_phase": None,       # None | "mount" | "feature" | "done"
+    "allowed_subcats": [],      # допустимые slug подкатегорий
+    "grille_routing": [],       # стек решений [{step, value, subcats_before}]
 })
 
 
@@ -83,30 +60,278 @@ def _get_session(session_id: str) -> dict[str, Any]:
 
 def _reset_funnel(session_id: str) -> None:
     s = _get_session(session_id)
-    s["funnel_step"] = None
+    s["funnel_phase"] = None
+    s["scenario_key"] = None
+    s["step_idx"] = 0
     s["active_filters"] = {}
+    s["grille_phase"] = None
+    s["allowed_subcats"] = []
+    s["grille_routing"] = []
+
+
+def _get_scenario(session_id: str) -> dict:
+    key = _get_session(session_id).get("scenario_key") or "_default"
+    return FUNNEL_SCENARIOS.get(key, FUNNEL_SCENARIOS["_default"])
+
+
+# ─── Навигация ────────────────────────────────────────────────────────────────
+
+def _make_buttons(step_config: dict) -> list[ButtonOption]:
+    return [
+        ButtonOption(
+            label=opt["label"],
+            value=opt.get("filter_value", opt.get("value", opt["label"])),
+        )
+        for opt in step_config.get("options", [])
+    ]
 
 
 def _goto_main_menu(session_id: str) -> ChatResponse:
-    """Сбрасывает воронку и возвращает первый шаг (= главное меню)."""
     _reset_funnel(session_id)
-    session = _get_session(session_id)
-    first_step_id = FUNNEL_ORDER[0]
-    session["funnel_step"] = first_step_id
-    step_config = FUNNEL_STEPS_MAP[first_step_id]
+    _get_session(session_id)["funnel_phase"] = "product_type"
     return ChatResponse(
-        reply=step_config["question"],
+        reply=PRODUCT_TYPE_STEP["question"],
         action=ChatAction.ASK_QUESTION,
-        buttons=_make_buttons(step_config),
+        buttons=_make_buttons(PRODUCT_TYPE_STEP),
     )
 
 
-# ─── Lifespan (запуск/остановка) ───────────────────────────────────────────────
+def _current_step_response(session_id: str) -> ChatResponse:
+    session = _get_session(session_id)
+    step = _get_scenario(session_id)["steps"][session["step_idx"]]
+    return ChatResponse(
+        reply=step["question"],
+        action=ChatAction.ASK_QUESTION,
+        buttons=_make_buttons(step),
+    )
+
+
+def _activate_scenario(session_id: str, scenario_key: str) -> ChatResponse:
+    session = _get_session(session_id)
+    effective_key = scenario_key if scenario_key in FUNNEL_SCENARIOS else "_default"
+    scenario = FUNNEL_SCENARIOS[effective_key]
+
+    session["scenario_key"] = effective_key
+    session["funnel_phase"] = "scenario"
+    session["step_idx"] = 0
+    session["grille_phase"] = None
+    session["grille_routing"] = []
+
+    if scenario_key:
+        session["active_filters"]["product_type"] = scenario_key
+
+    for k, v in scenario.get("auto_filters", {}).items():
+        session["active_filters"][k] = v
+
+    if effective_key == "grille":
+        session["allowed_subcats"] = list(SUBCATEGORY_RULES.keys())
+
+    if not scenario["steps"]:
+        return _do_filtered_search_sync(session_id, "")
+
+    return _current_step_response(session_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SMART ROUTING (подкатегории решеток)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _filter_subcats_by_location(location: str) -> list[str]:
+    if not location:
+        return list(SUBCATEGORY_RULES.keys())
+    return [
+        slug for slug, rules in SUBCATEGORY_RULES.items()
+        if location in rules.get("location", [])
+    ]
+
+
+def _filter_subcats_by_mount(
+    subcats: list[str], location: str, mount_value: str,
+) -> list[str]:
+    if not mount_value:
+        return subcats
+    chosen_mounts: set[str] = set()
+    for opt in GRILLE_MOUNT_OPTIONS.get(location, []):
+        if opt["value"] == mount_value:
+            chosen_mounts = set(opt["mounts"])
+            break
+    if not chosen_mounts:
+        for loc_opts in GRILLE_MOUNT_OPTIONS.values():
+            for opt in loc_opts:
+                if opt["value"] == mount_value:
+                    chosen_mounts = set(opt["mounts"])
+                    break
+            if chosen_mounts:
+                break
+    if not chosen_mounts:
+        return subcats
+    result = [
+        slug for slug in subcats
+        if set(SUBCATEGORY_RULES.get(slug, {}).get("mount", [])) & chosen_mounts
+    ]
+    return result or subcats
+
+
+def _filter_subcats_by_feature(subcats: list[str], feature: str) -> list[str]:
+    if not feature:
+        return subcats
+    result = [
+        slug for slug in subcats
+        if SUBCATEGORY_RULES.get(slug, {}).get("feature") == feature
+    ]
+    return result or subcats
+
+
+def _grille_mount_options(location: str, subcats: list[str]) -> list[dict]:
+    """Возвращает варианты монтажа, для которых есть подкатегории."""
+    cfg = GRILLE_MOUNT_OPTIONS.get(location, GRILLE_MOUNT_OPTIONS.get("indoor", []))
+    available = []
+    for opt in cfg:
+        mounts_set = set(opt["mounts"])
+        if any(mounts_set & set(SUBCATEGORY_RULES.get(s, {}).get("mount", [])) for s in subcats):
+            available.append(opt)
+    return available
+
+
+def _grille_feature_options(subcats: list[str]) -> list[dict]:
+    """Возвращает уникальные feature-варианты из оставшихся подкатегорий."""
+    seen: set[str] = set()
+    options: list[dict] = []
+    for slug in subcats:
+        feat = SUBCATEGORY_RULES.get(slug, {}).get("feature", "general")
+        if feat not in seen:
+            seen.add(feat)
+            options.append({
+                "label": GRILLE_FEATURE_LABELS.get(feat, feat),
+                "value": feat,
+            })
+    return options
+
+
+def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
+    """
+    Определяет следующий динамический шаг Smart Routing.
+
+    Если осталась 1 подкатегория или все уточнения пройдены —
+    переходит к статическим шагам (material / size).
+    """
+    session = _get_session(session_id)
+    subcats = session["allowed_subcats"]
+    location = session["active_filters"].get("location", "")
+    phase = session["grille_phase"]
+
+    # ── Шаг: Монтаж (если ещё не пройден) ──
+    if phase is None:
+        mount_opts = _grille_mount_options(location, subcats)
+        if len(mount_opts) > 1:
+            session["grille_phase"] = "mount"
+            buttons = [ButtonOption(label=o["label"], value=o["value"]) for o in mount_opts]
+            buttons.append(ButtonOption(label="Не важно", value=""))
+            return ChatResponse(
+                reply=prefix + "Как будет выполнен монтаж решетки?",
+                action=ChatAction.ASK_QUESTION,
+                buttons=buttons,
+            )
+        elif len(mount_opts) == 1:
+            subcats = _filter_subcats_by_mount(subcats, location, mount_opts[0]["value"])
+            session["allowed_subcats"] = subcats
+
+    # ── Шаг: Особенности (если >1 feature осталось) ──
+    if phase in (None, "mount_done"):
+        feat_opts = _grille_feature_options(subcats)
+        if len(feat_opts) > 1:
+            session["grille_phase"] = "feature"
+            buttons = [ButtonOption(label=o["label"], value=o["value"]) for o in feat_opts]
+            buttons.append(ButtonOption(label="Не важно", value=""))
+            return ChatResponse(
+                reply=prefix + "Какие требования к решетке?",
+                action=ChatAction.ASK_QUESTION,
+                buttons=buttons,
+            )
+
+    # ── Routing завершён → к material/size ──
+    session["grille_phase"] = "done"
+    session["step_idx"] = 1  # material — steps[1] в grille
+
+    if len(subcats) == 1:
+        label = SUBCATEGORY_RULES.get(subcats[0], {}).get("label", "")
+        if label:
+            prefix += f"Подобрали: {label}.\n\n"
+    elif subcats:
+        count = len(subcats)
+        prefix += f"Подходящих типов: {count}.\n\n"
+
+    step = _get_scenario(session_id)["steps"][1]
+    return ChatResponse(
+        reply=prefix + step["question"],
+        action=ChatAction.ASK_QUESTION,
+        buttons=_make_buttons(step),
+    )
+
+
+def _grille_handle_answer(session_id: str, message: str) -> ChatResponse:
+    """Обрабатывает ответ на динамический шаг Smart Routing."""
+    session = _get_session(session_id)
+    phase = session["grille_phase"]
+    location = session["active_filters"].get("location", "")
+
+    session["grille_routing"].append({
+        "step": phase,
+        "value": message,
+        "subcats_before": list(session["allowed_subcats"]),
+    })
+
+    if phase == "mount":
+        subcats = _filter_subcats_by_mount(session["allowed_subcats"], location, message)
+        session["allowed_subcats"] = subcats
+        session["grille_phase"] = "mount_done"
+        return _grille_advance(session_id)
+
+    if phase == "feature":
+        subcats = _filter_subcats_by_feature(session["allowed_subcats"], message)
+        session["allowed_subcats"] = subcats
+        session["grille_phase"] = "feature_done"
+        return _grille_advance(session_id)
+
+    return _grille_advance(session_id)
+
+
+def _grille_back(session_id: str) -> ChatResponse:
+    """Навигация «Назад» внутри Smart Routing."""
+    session = _get_session(session_id)
+    routing = session["grille_routing"]
+
+    if routing:
+        last = routing.pop()
+        session["allowed_subcats"] = last["subcats_before"]
+        prev_step = last["step"]
+
+        if prev_step == "mount":
+            session["grille_phase"] = None
+            session["active_filters"].pop("location", None)
+            session["step_idx"] = 0
+            return _current_step_response(session_id)
+
+        if prev_step == "feature":
+            session["grille_phase"] = "mount_done"
+            if routing and routing[-1]["step"] == "mount":
+                session["grille_phase"] = "mount"
+                return _grille_advance(session_id)
+            session["grille_phase"] = None
+            return _grille_advance(session_id)
+
+    session["grille_phase"] = None
+    session["active_filters"].pop("location", None)
+    session["allowed_subcats"] = list(SUBCATEGORY_RULES.keys())
+    session["step_idx"] = 0
+    return _current_step_response(session_id)
+
+
+# ─── Lifespan ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Запуск FastAPI-бэкенда …")
-
     try:
         get_llm()
     except RuntimeError as exc:
@@ -118,21 +343,12 @@ async def lifespan(app: FastAPI):
         reindex_all()
 
     sched = start_scheduler()
-
     yield
-
     sched.shutdown(wait=False)
     log.info("FastAPI-бэкенд остановлен.")
 
 
-# ─── Приложение ────────────────────────────────────────────────────────────────
-
-app = FastAPI(
-    title="Бот-консультант ВРК",
-    version="2.0.0",
-    lifespan=lifespan,
-)
-
+app = FastAPI(title="Бот-консультант ВРК", version="3.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -140,14 +356,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-# ─── Утилиты RAG / LLM ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# УТИЛИТЫ RAG / LLM
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_context(results: list[dict]) -> str:
-    """Собирает контекст из результатов поиска для промпта."""
     if not results:
         return "В базе знаний ничего не найдено по данному запросу."
     parts = []
@@ -165,163 +381,73 @@ def _build_context(results: list[dict]) -> str:
             f"location={meta.get('location','?')}, "
             f"product_type={meta.get('product_type','?')}, "
             f"size_group={meta.get('size_group','?')}\n"
-            f"Характеристики с сайта: {attrs_str}"
+            f"Характеристики: {attrs_str}"
         )
     return "\n\n".join(parts)
 
 
 def _format_active_filters(session_id: str) -> str:
-    """Строковое представление активных фильтров для системного промпта."""
     session = _get_session(session_id)
     active = session.get("active_filters", {})
     if not active:
         return "Не заданы (свободный режим)"
+
+    scenario = _get_scenario(session_id)
+    all_steps = [PRODUCT_TYPE_STEP] + scenario.get("steps", [])
+    step_map = {s["step_id"]: s for s in all_steps}
+
     parts = []
     for step_id, value in active.items():
-        if value:
-            step_config = FUNNEL_STEPS_MAP.get(step_id, {})
-            label = value
-            for opt in step_config.get("options", []):
-                if opt["filter_value"] == value:
-                    label = f"{opt['label']} ({value})"
-                    break
-            parts.append(f"{step_id}: {label}")
-        else:
+        if not value:
             parts.append(f"{step_id}: не важно")
-    return ", ".join(parts) if parts else "Все фильтры пропущены"
+            continue
+        step_cfg = step_map.get(step_id, {})
+        label = value
+        for opt in step_cfg.get("options", []):
+            if opt.get("filter_value") == value:
+                label = f"{opt['label']} ({value})"
+                break
+        parts.append(f"{step_id}: {label}")
+
+    subcats = session.get("allowed_subcats", [])
+    if subcats and len(subcats) <= 5:
+        labels = [SUBCATEGORY_RULES.get(s, {}).get("label", s) for s in subcats]
+        parts.append(f"подкатегории: {', '.join(labels)}")
+
+    return ", ".join(parts)
 
 
-async def _ask_llm(
-    user_message: str,
-    session_id: str,
-    context: str,
-) -> str:
-    """Отправляет запрос к LLM с контекстом, фильтрами и историей."""
+async def _ask_llm(user_message: str, session_id: str, context: str) -> str:
     llm = get_llm()
     session = _get_session(session_id)
-
     filters_text = _format_active_filters(session_id)
     system_msg = SystemMessage(
         content=SYSTEM_PROMPT.format(context=context, active_filters=filters_text)
     )
-
     history = session["history"][-20:]
     messages = [system_msg] + history + [HumanMessage(content=user_message)]
-
     try:
         response: AIMessage = await llm.ainvoke(messages)
         answer = response.content
     except Exception as exc:
         log.error("Ошибка LLM: %s", exc)
-        answer = (
-            "Извините, произошла техническая ошибка. "
-            "Попробуйте ещё раз или свяжитесь с менеджером."
-        )
-
+        answer = "Извините, произошла техническая ошибка. Попробуйте ещё раз или свяжитесь с менеджером."
     session["history"].append(HumanMessage(content=user_message))
     session["history"].append(AIMessage(content=answer))
-
     return answer
 
 
-# ─── Логика воронки с фильтрами ───────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ПОИСК С ФИЛЬТРАЦИЕЙ, ВАЛИДАЦИЕЙ И SUB_CATEGORY
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _is_start_funnel(message: str) -> bool:
-    """Определяет, что пользователь хочет начать подбор."""
-    triggers = [
-        "старт", "начать", "подобрать", "помоги выбрать",
-        "нужна решетка", "нужен диффузор", "хочу купить",
-        "подбор", "каталог", "что есть",
-    ]
-    lower = message.lower().strip()
-    return any(t in lower for t in triggers)
-
-
-def _is_contact_request(message: str) -> bool:
-    """Определяет запрос связи с менеджером."""
-    triggers = [
-        "менеджер", "связаться", "позвонить", "телефон",
-        "контакт", "оператор", "человек",
-    ]
-    lower = message.lower().strip()
-    return any(t in lower for t in triggers)
-
-
-def _next_funnel_step(session_id: str) -> str | None:
-    """Определяет следующий шаг воронки, который ещё не заполнен."""
-    session = _get_session(session_id)
-    completed = session["active_filters"]
-    for step_id in FUNNEL_ORDER:
-        if step_id not in completed:
-            return step_id
-    return None
-
-
-def _handle_funnel_answer(session_id: str, answer: str) -> None:
-    """
-    Маппит ответ пользователя в filter_value и сохраняет в active_filters.
-
-    Ищет совпадение по filter_value или label в опциях текущего шага.
-    """
-    session = _get_session(session_id)
-    current_step = session["funnel_step"]
-    if not current_step:
-        return
-
-    step_config = FUNNEL_STEPS_MAP.get(current_step)
-    if not step_config:
-        return
-
-    filter_value = ""
-    for opt in step_config["options"]:
-        if opt["filter_value"] == answer or opt["label"] == answer:
-            filter_value = opt["filter_value"]
-            break
-
-    session["active_filters"][current_step] = filter_value
-
-
-def _make_buttons(step_config: dict) -> list[ButtonOption]:
-    """Создаёт список кнопок для шага воронки."""
-    return [
-        ButtonOption(
-            label=opt["label"],
-            value=opt["filter_value"] if opt["filter_value"] else opt["label"],
-        )
-        for opt in step_config["options"]
-    ]
-
-
-def _build_search_query(session_id: str) -> str:
-    """Формирует текстовый поисковый запрос из выбранных фильтров."""
-    session = _get_session(session_id)
-    parts = []
-    for step_id, value in session["active_filters"].items():
-        if not value:
-            continue
-        step_config = FUNNEL_STEPS_MAP.get(step_id)
-        if step_config:
-            for opt in step_config["options"]:
-                if opt["filter_value"] == value:
-                    parts.append(opt["label"])
-                    break
-    return " ".join(parts) if parts else "вентиляционное оборудование"
-
-
-def _build_where_filter(session_id: str) -> dict | None:
-    """
-    Формирует ChromaDB where-clause из накопленных active_filters.
-
-    Пустые значения (filter_value == "") пропускаются — частичная фильтрация.
-    """
-    session = _get_session(session_id)
-    active = session["active_filters"]
-    conditions: list[dict] = []
-
-    for key, value in active.items():
-        if value:
-            conditions.append({key: {"$eq": value}})
-
+def _build_where_filter(
+    active_filters: dict[str, str],
+    allowed_subcats: list[str] | None = None,
+) -> dict | None:
+    conditions = [{k: {"$eq": v}} for k, v in active_filters.items() if v]
+    if allowed_subcats:
+        conditions.append({"category": {"$in": allowed_subcats}})
     if not conditions:
         return None
     if len(conditions) == 1:
@@ -329,141 +455,80 @@ def _build_where_filter(session_id: str) -> dict | None:
     return {"$and": conditions}
 
 
+def _validate_product(meta: dict, active_filters: dict[str, str]) -> bool:
+    for key, value in active_filters.items():
+        if not value:
+            continue
+        product_value = meta.get(key, "")
+        if product_value and product_value != value:
+            return False
+    return True
+
+
 def _search_with_fallback(
     query: str,
-    session_id: str,
-    n_results: int = 5,
+    active_filters: dict[str, str],
+    scenario: dict,
+    allowed_subcats: list[str] | None = None,
+    n_results: int = 8,
 ) -> list[dict]:
-    """
-    Поиск с прогрессивным ослаблением фильтров.
+    where = _build_where_filter(active_filters, allowed_subcats)
+    results = search(query, n_results=n_results, where=where)
+    validated = [r for r in results if _validate_product(r.get("metadata", {}), active_filters)]
+    if validated:
+        return validated
 
-    Если строгий поиск (все фильтры) не дал результатов,
-    последовательно убираем менее важные фильтры (от конца FUNNEL_ORDER).
-    """
-    where_filter = _build_where_filter(session_id)
-    results = search(query, n_results=n_results, where=where_filter)
-    if results:
-        return results
+    relaxable = {k: v for k, v in active_filters.items() if v}
+    step_ids = list(reversed([s["step_id"] for s in scenario.get("steps", [])]))
 
+    for key_to_relax in step_ids:
+        if key_to_relax in relaxable:
+            relaxable.pop(key_to_relax)
+            relaxed = _build_where_filter(relaxable, allowed_subcats)
+            results = search(query, n_results=n_results, where=relaxed)
+            validated = [r for r in results if _validate_product(r.get("metadata", {}), relaxable)]
+            if validated:
+                log.info("Fallback: убран фильтр '%s', найдено %d", key_to_relax, len(validated))
+                return validated
+
+    if allowed_subcats:
+        relaxed = _build_where_filter(relaxable)
+        results = search(query, n_results=n_results, where=relaxed)
+        if results:
+            log.info("Fallback: убраны subcategory фильтры, найдено %d", len(results))
+            return results
+
+    raw = search(query, n_results=n_results)
+    pt = active_filters.get("product_type", "")
+    return [r for r in raw if _validate_product(r.get("metadata", {}), {"product_type": pt})] or raw[:n_results]
+
+
+def _build_search_query(session_id: str) -> str:
     session = _get_session(session_id)
-    active = {k: v for k, v in session["active_filters"].items() if v}
+    scenario = _get_scenario(session_id)
+    all_steps = [PRODUCT_TYPE_STEP] + scenario.get("steps", [])
+    step_map = {s["step_id"]: s for s in all_steps}
+    parts = []
+    for step_id, value in session["active_filters"].items():
+        if not value:
+            continue
+        step_cfg = step_map.get(step_id, {})
+        for opt in step_cfg.get("options", []):
+            if opt.get("filter_value") == value:
+                parts.append(opt["label"])
+                break
 
-    for key_to_relax in reversed(FUNNEL_ORDER):
-        if key_to_relax in active:
-            active.pop(key_to_relax)
-            conditions = [{k: {"$eq": v}} for k, v in active.items()]
-            relaxed_where = None
-            if len(conditions) == 1:
-                relaxed_where = conditions[0]
-            elif len(conditions) > 1:
-                relaxed_where = {"$and": conditions}
+    subcats = session.get("allowed_subcats", [])
+    if subcats and len(subcats) <= 3:
+        for s in subcats:
+            label = SUBCATEGORY_RULES.get(s, {}).get("label", "")
+            if label:
+                parts.append(label)
 
-            results = search(query, n_results=n_results, where=relaxed_where)
-            if results:
-                log.info(
-                    "Fallback: убран фильтр '%s', найдено %d результатов",
-                    key_to_relax, len(results),
-                )
-                return results
-
-    return search(query, n_results=n_results)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# УМНЫЙ АНАЛИЗ СВОБОДНОГО ТЕКСТА
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_SIZE_RE = re.compile(r"(\d+)\s*[×хxXХ]\s*(\d+)")
-
-
-def _extract_filters_from_text(text: str) -> dict[str, str]:
-    """
-    Извлекает фильтры из произвольного текста пользователя.
-
-    Пример: «подбери решетку для квартиры в потолок 300х500»
-    → {"product_type": "grille", "location": "indoor", "size_group": "small"}
-
-    Возвращает только те фильтры, которые удалось уверенно определить.
-    """
-    lower = text.lower()
-    filters: dict[str, str] = {}
-
-    # product_type
-    if any(w in lower for w in ("решетк", "решётк")):
-        filters["product_type"] = "grille"
-    elif "диффузор" in lower:
-        filters["product_type"] = "diffuser"
-    elif "клапан" in lower:
-        filters["product_type"] = "valve"
-    elif any(w in lower for w in ("воздухораспределител", "воздухораздат")):
-        filters["product_type"] = "distributor"
-    elif any(w in lower for w in ("электропривод", "привод")):
-        filters["product_type"] = "actuator"
-    elif any(w in lower for w in ("фильтр", "hepa")):
-        filters["product_type"] = "filter"
-
-    # location
-    if any(w in lower for w in (
-        "фасад", "улиц", "наружн", "уличн", "снаружи", "внешн",
-    )):
-        filters["location"] = "outdoor"
-    elif any(w in lower for w in (
-        "помещен", "внутр", "квартир", "офис", "потолок", "потолоч",
-        "стен", "комнат", "дом", "кухн", "ванн", "туалет",
-        "в пол", "наполн", "межкомнат", "переточн",
-    )):
-        filters["location"] = "indoor"
-
-    # material
-    if any(w in lower for w in (
-        "металл", "сталь", "стальн", "алюмини", "нержавейк",
-        "нержавеющ", "оцинков", "железн", "латун",
-    )):
-        filters["material"] = "metal"
-    elif any(w in lower for w in ("пластик", "пластмасс", "пвх", "полипропилен")):
-        filters["material"] = "plastic"
-    elif any(w in lower for w in ("дерев", "деревянн", "мдф", "шпон")):
-        filters["material"] = "wood"
-
-    # size_group
-    m = _SIZE_RE.search(text)
-    if m:
-        max_side = max(int(m.group(1)), int(m.group(2)))
-        filters["size_group"] = "small" if max_side < 1000 else "large"
-    elif any(w in lower for w in ("маленьк", "небольш", "компактн", "мини")):
-        filters["size_group"] = "small"
-    elif any(w in lower for w in ("больш", "крупн", "промышленн")):
-        filters["size_group"] = "large"
-
-    return filters
-
-
-def _is_known_option(message: str) -> bool:
-    """Проверяет, совпадает ли сообщение с одной из кнопок воронки."""
-    for step in FUNNEL_STEPS:
-        for opt in step["options"]:
-            if opt["filter_value"] == message or opt["label"] == message:
-                return True
-    return False
-
-
-def _describe_extracted(extracted: dict[str, str]) -> str:
-    """Формирует человекочитаемое описание извлечённых фильтров."""
-    parts: list[str] = []
-    for step_id, value in extracted.items():
-        step_config = FUNNEL_STEPS_MAP.get(step_id)
-        if step_config:
-            for opt in step_config["options"]:
-                if opt["filter_value"] == value:
-                    parts.append(opt["label"])
-                    break
-            else:
-                parts.append(value)
-    return ", ".join(parts)
+    return " ".join(parts) if parts else "вентиляционное оборудование"
 
 
 def _best_product_data(results: list[dict]) -> dict | None:
-    """Извлекает данные лучшего товара из результатов поиска."""
     if not results:
         return None
     best = results[0]["metadata"]
@@ -478,32 +543,28 @@ def _best_product_data(results: list[dict]) -> dict | None:
     }
 
 
-async def _do_filtered_search(
-    session_id: str,
-    user_message: str,
-) -> ChatResponse:
-    """Выполняет поиск с текущими active_filters и формирует ответ через LLM."""
+async def _do_filtered_search(session_id: str, user_message: str) -> ChatResponse:
     session = _get_session(session_id)
-    search_query = user_message or _build_search_query(session_id)
-    results = _search_with_fallback(search_query, session_id)
+    scenario = _get_scenario(session_id)
+    query = user_message or _build_search_query(session_id)
+    subcats = session.get("allowed_subcats") or None
+    results = _search_with_fallback(query, session["active_filters"], scenario, subcats)
 
     log.info(
-        "Поиск с фильтрами | filters=%s | query='%s' | results=%d",
+        "Поиск | scenario=%s | filters=%s | subcats=%s | results=%d",
+        session.get("scenario_key", "?"),
         session["active_filters"],
-        search_query[:80],
+        subcats[:3] if subcats else "all",
         len(results),
     )
 
     context = _build_context(results)
     llm_answer = await _ask_llm(
-        f"Клиент ищет: {search_query}. Подбери подходящие товары из контекста.",
-        session_id,
-        context,
+        f"Клиент ищет: {query}. Подбери подходящие товары из контекста.",
+        session_id, context,
     )
-
     product_data = _best_product_data(results)
     _reset_funnel(session_id)
-
     return ChatResponse(
         reply=llm_answer,
         action=ChatAction.SHOW_PRODUCT if product_data else ChatAction.CONTACT_MANAGER,
@@ -511,18 +572,208 @@ async def _do_filtered_search(
     )
 
 
-# ─── Главный обработчик ───────────────────────────────────────────────────────
+def _do_filtered_search_sync(session_id: str, user_message: str) -> ChatResponse:
+    _reset_funnel(session_id)
+    return ChatResponse(
+        reply="По выбранной категории выполняется поиск. Уточните запрос текстом.",
+        action=ChatAction.ASK_QUESTION,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# РАСПОЗНАВАНИЕ ТЕКСТА
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SIZE_RE = re.compile(r"(\d+)\s*[×хxXХ]\s*(\d+)")
+
+
+def _extract_filters_from_text(text: str) -> dict[str, str]:
+    lower = text.lower()
+    filters: dict[str, str] = {}
+
+    if any(w in lower for w in ("решетк", "решётк")):
+        filters["product_type"] = "grille"
+    elif "диффузор" in lower:
+        filters["product_type"] = "diffuser"
+    elif "клапан" in lower:
+        filters["product_type"] = "valve"
+    elif any(w in lower for w in ("воздухораспределител", "воздухораздат")):
+        filters["product_type"] = "distributor"
+    elif any(w in lower for w in ("электропривод", "привод")):
+        filters["product_type"] = "actuator"
+    elif any(w in lower for w in ("фильтр", "hepa")):
+        filters["product_type"] = "filter"
+
+    if any(w in lower for w in ("фасад", "улиц", "наружн", "уличн", "снаружи", "внешн")):
+        filters["location"] = "outdoor"
+    elif any(w in lower for w in (
+        "помещен", "внутр", "квартир", "офис", "потолок", "потолоч",
+        "стен", "комнат", "дом", "кухн", "ванн", "туалет",
+        "в пол", "наполн", "межкомнат", "переточн",
+    )):
+        filters["location"] = "indoor"
+
+    if any(w in lower for w in (
+        "металл", "сталь", "стальн", "алюмини", "нержавейк",
+        "нержавеющ", "оцинков", "железн", "латун",
+    )):
+        filters["material"] = "metal"
+    elif any(w in lower for w in ("пластик", "пластмасс", "пвх", "полипропилен")):
+        filters["material"] = "plastic"
+    elif any(w in lower for w in ("дерев", "деревянн", "мдф", "шпон")):
+        filters["material"] = "wood"
+
+    m = _SIZE_RE.search(text)
+    if m:
+        max_side = max(int(m.group(1)), int(m.group(2)))
+        filters["size_group"] = "small" if max_side < 1000 else "large"
+    elif any(w in lower for w in ("маленьк", "небольш", "компактн", "мини")):
+        filters["size_group"] = "small"
+    elif any(w in lower for w in ("больш", "крупн", "промышленн")):
+        filters["size_group"] = "large"
+
+    # Smart Routing hints (grille)
+    if any(w in lower for w in ("скрыт", "невидим", "под шпакл", "гипсокартон", "натяжн")):
+        filters["grille_mount"] = "concealed"
+    elif any(w in lower for w in ("напольн", "в пол")):
+        filters["grille_mount"] = "floor"
+    elif any(w in lower for w in ("потолоч", "в потолок")):
+        filters["grille_mount"] = "ceiling_open"
+    elif any(w in lower for w in ("переточн", "переток", "в дверь", "перегород")):
+        filters["grille_mount"] = "transfer"
+
+    if any(w in lower for w in ("акустич", "шумо", "звукоизол")):
+        filters["grille_feature"] = "acoustic"
+    elif "сотов" in lower:
+        filters["grille_feature"] = "honeycomb"
+    elif "сетч" in lower:
+        filters["grille_feature"] = "mesh"
+    elif any(w in lower for w in ("перфорир", "перфорац")):
+        filters["grille_feature"] = "perforated"
+    elif "щелев" in lower:
+        filters["grille_feature"] = "slot"
+    elif any(w in lower for w in ("декоратив", "дизайн")):
+        filters["grille_feature"] = "decorative"
+    elif "люк" in lower:
+        filters["grille_feature"] = "hatch"
+    elif any(w in lower for w in ("инерцион", "обратн")):
+        filters["grille_feature"] = "inertial"
+
+    return filters
+
+
+def _validate_extracted(
+    extracted: dict[str, str], scenario: dict, text: str,
+) -> tuple[dict[str, str], list[str]]:
+    valid = dict(extracted)
+    warnings: list[str] = []
+
+    if "material" in valid:
+        allowed = scenario.get("allowed_materials", [])
+        if allowed and valid["material"] not in allowed:
+            cat_label = scenario.get("label", "эта категория")
+            warnings.append(
+                f"В категории «{cat_label}» доступны только материалы: {', '.join(allowed)}."
+            )
+            del valid["material"]
+
+    m = _SIZE_RE.search(text)
+    if m:
+        max_side = max(int(m.group(1)), int(m.group(2)))
+        max_allowed = scenario.get("max_size_mm", 9999)
+        if max_side > max_allowed:
+            warnings.append(
+                f"Максимальный размер для данной категории: {max_allowed} мм. "
+                f"Указанный ({max_side} мм) превышает допустимый."
+            )
+            valid.pop("size_group", None)
+
+    return valid, warnings
+
+
+def _is_known_option(message: str) -> bool:
+    for opt in PRODUCT_TYPE_STEP["options"]:
+        if opt.get("filter_value") == message or opt["label"] == message:
+            return True
+    for scenario in FUNNEL_SCENARIOS.values():
+        for step in scenario["steps"]:
+            for opt in step.get("options", []):
+                if opt.get("filter_value") == message or opt["label"] == message:
+                    return True
+    return False
+
+
+def _describe_extracted(extracted: dict[str, str]) -> str:
+    all_steps = [PRODUCT_TYPE_STEP]
+    for sc in FUNNEL_SCENARIOS.values():
+        all_steps.extend(sc["steps"])
+    step_map: dict[str, dict] = {}
+    for s in all_steps:
+        if s["step_id"] not in step_map:
+            step_map[s["step_id"]] = s
+
+    parts: list[str] = []
+    for step_id, value in extracted.items():
+        if step_id.startswith("grille_"):
+            if step_id == "grille_mount":
+                for loc_opts in GRILLE_MOUNT_OPTIONS.values():
+                    for o in loc_opts:
+                        if o["value"] == value:
+                            parts.append(o["label"])
+                            break
+            elif step_id == "grille_feature":
+                parts.append(GRILLE_FEATURE_LABELS.get(value, value))
+            continue
+        cfg = step_map.get(step_id, {})
+        for opt in cfg.get("options", []):
+            if opt.get("filter_value") == value:
+                parts.append(opt["label"])
+                break
+        else:
+            parts.append(value)
+    return ", ".join(parts)
+
+
+def _is_start_funnel(message: str) -> bool:
+    triggers = [
+        "старт", "начать", "подобрать", "помоги выбрать",
+        "нужна решетка", "нужен диффузор", "хочу купить",
+        "подбор", "каталог", "что есть",
+    ]
+    return any(t in message.lower().strip() for t in triggers)
+
+
+def _is_contact_request(message: str) -> bool:
+    triggers = [
+        "менеджер", "связаться", "позвонить", "телефон",
+        "контакт", "оператор", "человек",
+    ]
+    return any(t in message.lower().strip() for t in triggers)
+
+
+def _apply_grille_text_routing(session_id: str, extracted: dict[str, str]) -> None:
+    """Применяет Smart Routing hints из текста к сессии grille."""
+    session = _get_session(session_id)
+    location = extracted.get("location") or session["active_filters"].get("location", "")
+    subcats = _filter_subcats_by_location(location) if location else list(SUBCATEGORY_RULES.keys())
+
+    mount_hint = extracted.get("grille_mount")
+    if mount_hint:
+        subcats = _filter_subcats_by_mount(subcats, location, mount_hint)
+
+    feature_hint = extracted.get("grille_feature")
+    if feature_hint:
+        subcats = _filter_subcats_by_feature(subcats, feature_hint)
+
+    session["allowed_subcats"] = subcats
+    session["grille_phase"] = "done" if (mount_hint or feature_hint) else None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ГЛАВНЫЙ ОБРАБОТЧИК
+# ═══════════════════════════════════════════════════════════════════════════════
 
 async def process_message(request: ChatRequest) -> ChatResponse:
-    """
-    Единая бизнес-логика обработки сообщения (веб + телеграм).
-
-    Поддерживает три режима ввода:
-    1. Нажатие кнопки — классический проход по воронке.
-    2. Свободный текст с описанием товара — извлечение фильтров из текста,
-       автозаполнение известных параметров, уточнение недостающих.
-    3. Вопрос не о товаре — RAG-ответ без фильтрации.
-    """
     session_id = request.session_id
     message = request.message.strip()
     session = _get_session(session_id)
@@ -532,18 +783,39 @@ async def process_message(request: ChatRequest) -> ChatResponse:
         return _goto_main_menu(session_id)
 
     if message == "__back__":
-        current_step = session["funnel_step"]
-        if current_step and current_step in FUNNEL_ORDER:
-            idx = FUNNEL_ORDER.index(current_step)
+        phase = session["funnel_phase"]
+        if phase == "scenario":
+            grille_phase = session.get("grille_phase")
+            scenario = _get_scenario(session_id)
+
+            if scenario.get("dynamic") and grille_phase in ("mount", "feature"):
+                return _grille_back(session_id)
+
+            if scenario.get("dynamic") and grille_phase == "done":
+                idx = session["step_idx"]
+                if idx > 1:
+                    prev_step = scenario["steps"][idx - 1]
+                    session["active_filters"].pop(prev_step["step_id"], None)
+                    session["step_idx"] = idx - 1
+                    return _current_step_response(session_id)
+                else:
+                    return _grille_back(session_id)
+
+            idx = session["step_idx"]
             if idx > 0:
-                prev_step_id = FUNNEL_ORDER[idx - 1]
-                session["active_filters"].pop(prev_step_id, None)
-                session["funnel_step"] = prev_step_id
-                step_config = FUNNEL_STEPS_MAP[prev_step_id]
+                prev_step = scenario["steps"][idx - 1]
+                session["active_filters"].pop(prev_step["step_id"], None)
+                session["step_idx"] = idx - 1
+                return _current_step_response(session_id)
+            else:
+                session["active_filters"].pop("product_type", None)
+                session["active_filters"].clear()
+                session["funnel_phase"] = "product_type"
+                session["scenario_key"] = None
                 return ChatResponse(
-                    reply=step_config["question"],
+                    reply=PRODUCT_TYPE_STEP["question"],
                     action=ChatAction.ASK_QUESTION,
-                    buttons=_make_buttons(step_config),
+                    buttons=_make_buttons(PRODUCT_TYPE_STEP),
                 )
         return _goto_main_menu(session_id)
 
@@ -561,65 +833,142 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             action=ChatAction.CONTACT_MANAGER,
         )
 
-    # ── Нажатие кнопки воронки (точное совпадение) ──
-    if _is_known_option(message):
-        if session["funnel_step"] is not None:
-            _handle_funnel_answer(session_id, message)
-        else:
-            for step in FUNNEL_STEPS:
-                for opt in step["options"]:
-                    if opt["filter_value"] == message or opt["label"] == message:
-                        session["active_filters"][step["step_id"]] = opt["filter_value"]
-                        break
+    # ── Фаза: выбор категории ──
+    if session["funnel_phase"] == "product_type":
+        for opt in PRODUCT_TYPE_STEP["options"]:
+            if opt["filter_value"] == message or opt["label"] == message:
+                return _activate_scenario(session_id, opt["filter_value"] or "_default")
 
-        next_step = _next_funnel_step(session_id)
-        if next_step:
-            session["funnel_step"] = next_step
-            step_config = FUNNEL_STEPS_MAP[next_step]
-            return ChatResponse(
-                reply=step_config["question"],
-                action=ChatAction.ASK_QUESTION,
-                buttons=_make_buttons(step_config),
-            )
-        return await _do_filtered_search(session_id, _build_search_query(session_id))
+    # ── Фаза: шаги сценария ──
+    if session["funnel_phase"] == "scenario":
+        scenario = _get_scenario(session_id)
 
-    # ── Извлечение фильтров из свободного текста ──
+        # Grille Smart Routing: динамические шаги
+        if scenario.get("dynamic") and session.get("grille_phase") in ("mount", "feature"):
+            return _grille_handle_answer(session_id, message)
+
+        idx = session["step_idx"]
+        steps = scenario["steps"]
+
+        if idx < len(steps):
+            current_step = steps[idx]
+            chosen_value = None
+            for opt in current_step.get("options", []):
+                if opt.get("filter_value") == message or opt["label"] == message:
+                    chosen_value = opt.get("filter_value", "")
+                    break
+
+            if chosen_value is not None:
+                session["active_filters"][current_step["step_id"]] = chosen_value
+
+                # Grille: после location → Smart Routing
+                if scenario.get("dynamic") and current_step["step_id"] == "location":
+                    subcats = _filter_subcats_by_location(chosen_value)
+                    session["allowed_subcats"] = subcats
+
+                    if len(subcats) == 0:
+                        session["grille_phase"] = "done"
+                        session["step_idx"] = 1
+                        return _current_step_response(session_id)
+
+                    return _grille_advance(session_id)
+
+                session["step_idx"] = idx + 1
+                if session["step_idx"] < len(steps):
+                    return _current_step_response(session_id)
+                return await _do_filtered_search(session_id, _build_search_query(session_id))
+
+    # ── Умный анализ свободного текста ──
     extracted = _extract_filters_from_text(message)
 
     if extracted:
-        for key, value in extracted.items():
-            session["active_filters"][key] = value
+        pt = extracted.get("product_type") or session.get("scenario_key")
+        scenario_key = pt or "_default"
+        scenario = FUNNEL_SCENARIOS.get(scenario_key, FUNNEL_SCENARIOS["_default"])
 
-        next_step = _next_funnel_step(session_id)
-        if next_step:
-            session["funnel_step"] = next_step
-            step_config = FUNNEL_STEPS_MAP[next_step]
-            understood = _describe_extracted(extracted)
-            prefix = f"✅ Понял: {understood}.\n\n" if understood else ""
+        valid_filters, warnings = _validate_extracted(extracted, scenario, message)
+
+        if "product_type" in valid_filters and valid_filters["product_type"]:
+            session["scenario_key"] = valid_filters["product_type"]
+            session["active_filters"]["product_type"] = valid_filters["product_type"]
+            scenario = _get_scenario(session_id)
+            for k, v in scenario.get("auto_filters", {}).items():
+                if k not in valid_filters:
+                    session["active_filters"][k] = v
+
+        for key, value in valid_filters.items():
+            if key != "product_type" and not key.startswith("grille_"):
+                session["active_filters"][key] = value
+
+        # Smart Routing для grille через текст
+        if session.get("scenario_key") == "grille":
+            if "grille_mount" in extracted or "grille_feature" in extracted:
+                _apply_grille_text_routing(session_id, extracted)
+            elif "location" in valid_filters:
+                session["allowed_subcats"] = _filter_subcats_by_location(valid_filters["location"])
+
+        scenario = _get_scenario(session_id)
+        steps = scenario.get("steps", [])
+        step_ids = [s["step_id"] for s in steps]
+
+        next_idx = None
+        for i, sid in enumerate(step_ids):
+            if sid not in session["active_filters"]:
+                next_idx = i
+                break
+
+        is_grille_routing_done = (
+            session.get("scenario_key") == "grille"
+            and session.get("grille_phase") == "done"
+        )
+
+        if next_idx is not None:
+            if session.get("scenario_key") == "grille" and not is_grille_routing_done:
+                if next_idx == 0:
+                    pass
+                elif next_idx >= 1 and session.get("grille_phase") != "done":
+                    return _grille_advance(session_id)
+
+            session["funnel_phase"] = "scenario"
+            session["step_idx"] = next_idx
+            step_cfg = steps[next_idx]
+
+            warning_prefix = "\n".join(f"⚠️ {w}" for w in warnings)
+            understood = _describe_extracted(valid_filters)
+            confirm_prefix = f"✅ Понял: {understood}." if understood else ""
+            prefix_parts = [p for p in (warning_prefix, confirm_prefix) if p]
+            prefix = "\n\n".join(prefix_parts)
+            if prefix:
+                prefix += "\n\n"
+
             return ChatResponse(
-                reply=prefix + step_config["question"],
+                reply=prefix + step_cfg["question"],
                 action=ChatAction.ASK_QUESTION,
-                buttons=_make_buttons(step_config),
+                buttons=_make_buttons(step_cfg),
             )
+
         return await _do_filtered_search(session_id, message)
 
-    # ── Триггеры начала воронки (без фильтров в тексте) ──
-    if _is_start_funnel(message) and session["funnel_step"] is None:
+    # ── Триггеры начала воронки ──
+    if _is_start_funnel(message) and session["funnel_phase"] is None:
         return _goto_main_menu(session_id)
 
     # ── Свободный вопрос (RAG) ──
-    # Если пользователь в воронке, но написал вопрос не по теме подбора —
-    # отвечаем через RAG и показываем текущий шаг воронки для продолжения.
     results = search(message, n_results=5)
     context = _build_context(results)
     llm_answer = await _ask_llm(message, session_id, context)
 
-    if session["funnel_step"] is not None:
-        step_config = FUNNEL_STEPS_MAP[session["funnel_step"]]
+    if session["funnel_phase"] in ("product_type", "scenario"):
+        if session["funnel_phase"] == "product_type":
+            step_cfg = PRODUCT_TYPE_STEP
+        else:
+            scenario = _get_scenario(session_id)
+            idx = session["step_idx"]
+            step_cfg = scenario["steps"][idx] if idx < len(scenario["steps"]) else PRODUCT_TYPE_STEP
         return ChatResponse(
-            reply=llm_answer + f"\n\n{step_config['question']}",
+            reply=llm_answer + f"\n\n{step_cfg['question']}",
             action=ChatAction.ASK_QUESTION,
-            buttons=_make_buttons(step_config),
+            buttons=_make_buttons(step_cfg),
         )
 
     product_data = None
@@ -628,54 +977,30 @@ async def process_message(request: ChatRequest) -> ChatResponse:
         product_data = _best_product_data(results)
         action = ChatAction.SHOW_PRODUCT
 
-    return ChatResponse(
-        reply=llm_answer,
-        action=action,
-        product_data=product_data,
-    )
+    return ChatResponse(reply=llm_answer, action=action, product_data=product_data)
 
 
 # ─── API Endpoints ─────────────────────────────────────────────────────────────
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest) -> ChatResponse:
-    """Универсальный эндпоинт чата для веб-виджета и Telegram."""
-    log.info(
-        "Запрос [%s] session=%s: %s",
-        request.source,
-        request.session_id[:8],
-        request.message[:100],
-    )
+    log.info("Запрос [%s] session=%s: %s", request.source, request.session_id[:8], request.message[:100])
     response = await process_message(request)
-    log.info(
-        "Ответ [%s] action=%s: %s",
-        request.source,
-        response.action.value,
-        response.reply[:100],
-    )
+    log.info("Ответ [%s] action=%s: %s", request.source, response.action.value, response.reply[:100])
     return response
 
 
 @app.get("/health")
 async def health_check() -> dict:
-    """Проверка статуса системы."""
     col = get_collection()
     llm_ok = True
     try:
         get_llm()
     except RuntimeError:
         llm_ok = False
+    return {"status": "ok", "llm_available": llm_ok, "chroma_documents": col.count()}
 
-    return {
-        "status": "ok",
-        "llm_available": llm_ok,
-        "chroma_documents": col.count(),
-    }
-
-
-# ─── Точка входа ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

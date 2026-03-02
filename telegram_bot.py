@@ -15,6 +15,7 @@ Telegram-бот ООО "Завод ВРК" на aiogram 3.x.
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -30,9 +31,8 @@ from aiogram.types import (
 )
 
 from config import (
-    FUNNEL_ORDER,
-    FUNNEL_STEPS_MAP,
     MANAGER_CONTACTS,
+    PRODUCT_TYPE_STEP,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_WELCOME_TEXT,
 )
@@ -74,31 +74,31 @@ _MAIN_KEYBOARD = ReplyKeyboardMarkup(
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 
 def _is_main_menu(response: ChatResponse) -> bool:
-    """Проверяет, является ли ответ главным меню (первый шаг воронки)."""
-    if not FUNNEL_ORDER:
-        return False
-    first_step = FUNNEL_STEPS_MAP.get(FUNNEL_ORDER[0])
-    return first_step is not None and response.reply == first_step["question"]
+    """Проверяет, является ли ответ главным меню (выбор категории)."""
+    return response.reply == PRODUCT_TYPE_STEP["question"]
 
 
 def _build_inline_keyboard(
     buttons: list[ButtonOption] | None = None,
     with_nav: bool = True,
+    product_url: str | None = None,
 ) -> InlineKeyboardMarkup:
-    """Собирает Inline-клавиатуру с/без навигационных кнопок."""
+    """Собирает Inline-клавиатуру: кнопки воронки + ссылка на товар + навигация."""
     rows: list[list[InlineKeyboardButton]] = []
     if buttons:
         for btn in buttons:
             rows.append([
                 InlineKeyboardButton(text=btn.label, callback_data=btn.value[:64])
             ])
+    if product_url:
+        rows.append([InlineKeyboardButton(text="🔗 Открыть на сайте", url=product_url)])
     if with_nav:
         rows.append(_NAV_ROW)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _format_product_card(data: dict) -> str:
-    """Форматирует карточку товара для Telegram."""
+    """Форматирует карточку товара для Telegram (без голых URL)."""
     parts = []
     if data.get("name"):
         parts.append(f"<b>{data['name']}</b>")
@@ -106,9 +106,20 @@ def _format_product_card(data: dict) -> str:
         parts.append(f"Артикул: {data['article']}")
     if data.get("price"):
         parts.append(f"💰 Цена: <b>{data['price']}</b>")
-    if data.get("url"):
-        parts.append(f'🔗 <a href="{data["url"]}">Открыть на сайте</a>')
+    if data.get("material"):
+        parts.append(f"Материал: {data['material']}")
+    if data.get("location"):
+        loc_label = "наружное" if data["location"] == "outdoor" else "внутреннее"
+        parts.append(f"Назначение: {loc_label}")
     return "\n".join(parts)
+
+
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _strip_bare_urls(text: str) -> str:
+    """Убирает голые URL из текста (они дублируют кнопку-ссылку)."""
+    return _URL_RE.sub("", text).strip()
 
 
 async def _send_response(
@@ -118,24 +129,28 @@ async def _send_response(
     """
     Отправляет ответ бота в Telegram-чат.
 
-    Навигационные кнопки «Назад» / «Главное меню» добавляются
-    автоматически ко всем сообщениям, КРОМЕ главного меню (первый шаг воронки).
+    - Голые URL удаляются из текста LLM (ссылка идёт кнопкой).
+    - Кнопка «🔗 Открыть на сайте» добавляется если есть product_data.url.
+    - Навигация «Назад» / «Главное меню» — на всех шагах кроме главного меню.
     """
     if isinstance(target, CallbackQuery):
         send = target.message.answer
     else:
         send = target.answer
 
-    text = response.reply
+    text = _strip_bare_urls(response.reply)
 
+    product_url = None
     if response.action == ChatAction.SHOW_PRODUCT and response.product_data:
         card = _format_product_card(response.product_data)
-        text = f"{text}\n\n{card}"
+        text = f"{_strip_bare_urls(text)}\n\n{card}"
+        product_url = response.product_data.get("url")
 
     show_nav = not _is_main_menu(response)
     inline_kb = _build_inline_keyboard(
         response.buttons if response.buttons else None,
         with_nav=show_nav,
+        product_url=product_url,
     )
 
     await send(
