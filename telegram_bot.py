@@ -87,8 +87,9 @@ def _build_inline_keyboard(
     rows: list[list[InlineKeyboardButton]] = []
     if buttons:
         for btn in buttons:
+            cb_data = (btn.value or btn.label)[:64]
             rows.append([
-                InlineKeyboardButton(text=btn.label, callback_data=btn.value[:64])
+                InlineKeyboardButton(text=btn.label, callback_data=cb_data)
             ])
     if product_url:
         rows.append([InlineKeyboardButton(text="🔗 Открыть на сайте", url=product_url)])
@@ -106,8 +107,6 @@ def _format_product_card(data: dict) -> str:
         parts.append(f"Артикул: {data['article']}")
     if data.get("price"):
         parts.append(f"💰 Цена: <b>{data['price']}</b>")
-    if data.get("material"):
-        parts.append(f"Материал: {data['material']}")
     if data.get("location"):
         loc_label = "наружное" if data["location"] == "outdoor" else "внутреннее"
         parts.append(f"Назначение: {loc_label}")

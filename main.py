@@ -80,7 +80,7 @@ def _make_buttons(step_config: dict) -> list[ButtonOption]:
     return [
         ButtonOption(
             label=opt["label"],
-            value=opt.get("filter_value", opt.get("value", opt["label"])),
+            value=opt.get("filter_value") or opt.get("value") or opt["label"],
         )
         for opt in step_config.get("options", [])
     ]
@@ -213,7 +213,7 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
     Определяет следующий динамический шаг Smart Routing.
 
     Если осталась 1 подкатегория или все уточнения пройдены —
-    переходит к статическим шагам (material / size).
+    переходит к статическим шагам (size_group).
     """
     session = _get_session(session_id)
     subcats = session["allowed_subcats"]
@@ -226,7 +226,7 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
         if len(mount_opts) > 1:
             session["grille_phase"] = "mount"
             buttons = [ButtonOption(label=o["label"], value=o["value"]) for o in mount_opts]
-            buttons.append(ButtonOption(label="Не важно", value=""))
+            buttons.append(ButtonOption(label="Не важно", value="any"))
             return ChatResponse(
                 reply=prefix + "Как будет выполнен монтаж решетки?",
                 action=ChatAction.ASK_QUESTION,
@@ -242,16 +242,16 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
         if len(feat_opts) > 1:
             session["grille_phase"] = "feature"
             buttons = [ButtonOption(label=o["label"], value=o["value"]) for o in feat_opts]
-            buttons.append(ButtonOption(label="Не важно", value=""))
+            buttons.append(ButtonOption(label="Не важно", value="any"))
             return ChatResponse(
                 reply=prefix + "Какие требования к решетке?",
                 action=ChatAction.ASK_QUESTION,
                 buttons=buttons,
             )
 
-    # ── Routing завершён → к material/size ──
+    # ── Routing завершён → к size_group ──
     session["grille_phase"] = "done"
-    session["step_idx"] = 1  # material — steps[1] в grille
+    session["step_idx"] = 1  # size_group — steps[1] в grille
 
     if len(subcats) == 1:
         label = SUBCATEGORY_RULES.get(subcats[0], {}).get("label", "")
@@ -377,8 +377,7 @@ def _build_context(results: list[dict]) -> str:
         attrs_str = ", ".join(f"{k}: {v}" for k, v in raw_attrs.items()) if raw_attrs else "нет данных"
         parts.append(
             f"--- Товар {i} ---\n{r['text']}\n"
-            f"Фильтры: material={meta.get('material','?')}, "
-            f"location={meta.get('location','?')}, "
+            f"Фильтры: location={meta.get('location','?')}, "
             f"product_type={meta.get('product_type','?')}, "
             f"size_group={meta.get('size_group','?')}\n"
             f"Характеристики: {attrs_str}"
@@ -538,7 +537,6 @@ def _best_product_data(results: list[dict]) -> dict | None:
         "price": best.get("price", ""),
         "url": best.get("url", ""),
         "category": best.get("category", ""),
-        "material": best.get("material", ""),
         "location": best.get("location", ""),
     }
 
@@ -613,16 +611,6 @@ def _extract_filters_from_text(text: str) -> dict[str, str]:
     )):
         filters["location"] = "indoor"
 
-    if any(w in lower for w in (
-        "металл", "сталь", "стальн", "алюмини", "нержавейк",
-        "нержавеющ", "оцинков", "железн", "латун",
-    )):
-        filters["material"] = "metal"
-    elif any(w in lower for w in ("пластик", "пластмасс", "пвх", "полипропилен")):
-        filters["material"] = "plastic"
-    elif any(w in lower for w in ("дерев", "деревянн", "мдф", "шпон")):
-        filters["material"] = "wood"
-
     m = _SIZE_RE.search(text)
     if m:
         max_side = max(int(m.group(1)), int(m.group(2)))
@@ -667,15 +655,6 @@ def _validate_extracted(
 ) -> tuple[dict[str, str], list[str]]:
     valid = dict(extracted)
     warnings: list[str] = []
-
-    if "material" in valid:
-        allowed = scenario.get("allowed_materials", [])
-        if allowed and valid["material"] not in allowed:
-            cat_label = scenario.get("label", "эта категория")
-            warnings.append(
-                f"В категории «{cat_label}» доступны только материалы: {', '.join(allowed)}."
-            )
-            del valid["material"]
 
     m = _SIZE_RE.search(text)
     if m:
