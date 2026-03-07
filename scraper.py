@@ -24,6 +24,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from config import (
     BASE_SITE_URL,
+    CATEGORY_SLUG_MAP,
     RAW_PRODUCTS_PATH,
     SCRAPER_MAX_RETRIES,
     SCRAPER_REQUEST_DELAY,
@@ -321,6 +322,56 @@ def _parse_card_attrs(soup: BeautifulSoup) -> dict[str, str]:
     return attrs
 
 
+# ─── Парсинг описания товара ────────────────────────────────────────────────────
+
+def _parse_description(soup: BeautifulSoup) -> str | None:
+    """
+    Извлекает текстовое описание товара из вкладки «Описание».
+
+    Источники (в порядке приоритета):
+    1. div.tab_content.active.ck-content → div.block_tab.text1
+    2. Первый div.block_tab.text1 на странице
+    3. Fallback через <p> внутри product-description / product-text
+    """
+    # Способ 1: вкладка «Описание» (активная)
+    tab = soup.select_one("div.tab_content.active.ck-content")
+    if tab:
+        block = tab.select_one("div.block_tab.text1")
+        target = block if block else tab
+        paragraphs = []
+        for el in target.find_all(["p", "li"]):
+            txt = _clean(el.get_text())
+            if txt and len(txt) > 20:
+                paragraphs.append(txt)
+        if paragraphs:
+            return "\n".join(paragraphs[:20])
+
+    # Способ 2: первый block_tab.text1
+    block = soup.select_one("div.block_tab.text1")
+    if block:
+        paragraphs = []
+        for el in block.find_all(["p", "li"]):
+            txt = _clean(el.get_text())
+            if txt and len(txt) > 20:
+                paragraphs.append(txt)
+        if paragraphs:
+            return "\n".join(paragraphs[:20])
+
+    # Способ 3: fallback
+    for cls in ("product-description", "product-text", "tab-content"):
+        container = soup.select_one(f"div.{cls}")
+        if container:
+            paragraphs = []
+            for p in container.find_all("p"):
+                txt = _clean(p.get_text())
+                if txt and len(txt) > 20:
+                    paragraphs.append(txt)
+            if paragraphs:
+                return "\n".join(paragraphs[:15])
+
+    return None
+
+
 # ─── Парсинг страницы товара ───────────────────────────────────────────────────
 
 def _parse_product_page(html: str, base_info: dict) -> Product:
@@ -347,24 +398,8 @@ def _parse_product_page(html: str, base_info: dict) -> Product:
         if m:
             article = m.group(1)
 
-    # Описание
-    desc_parts: list[str] = []
-    for section_title in ("Описание", "описание"):
-        header = soup.find(string=re.compile(section_title, re.I))
-        if header:
-            container = header.find_parent(["div", "section", "article"])
-            if container:
-                for p in container.find_all(["p", "li"]):
-                    txt = _clean(p.get_text())
-                    if txt and len(txt) > 20:
-                        desc_parts.append(txt)
-                break
-    if not desc_parts:
-        for p in soup.select("div.product-description p, div.product-text p, .tab-content p"):
-            txt = _clean(p.get_text())
-            if txt and len(txt) > 20:
-                desc_parts.append(txt)
-    description = "\n".join(desc_parts) if desc_parts else None
+    # Описание (из вкладки «Описание» / block_tab)
+    description = _parse_description(soup)
 
     # ── Характеристики (все пары ключ-значение) ──
     raw_attrs = _parse_card_attrs(soup)
@@ -539,8 +574,8 @@ def process_to_chunks(products: list[Product] | None = None) -> list[dict]:
     - text: человекочитаемый текст для эмбеддинга
     - metadata: нормализованные фильтры + служебные поля для where-clause
 
-    ТЕСТ: после запуска убедитесь, что в metadata каждого чанка
-    присутствуют ключи material, location, product_type, size_group.
+    Метаданные включают main_category (одна из 6 активных),
+    sub_category (slug из URL), а также фильтры location, product_type, size_group.
     """
     if products is None:
         existing = _load_existing()
@@ -568,14 +603,17 @@ def process_to_chunks(products: list[Product] | None = None) -> list[dict]:
         if attrs_text:
             text_parts.append(f"Характеристики: {attrs_text}")
         if p.description:
-            text_parts.append(f"Описание: {p.description[:1500]}")
+            text_parts.append(f"Описание: {p.description[:3000]}")
         text_parts.append(f"Ссылка: {p.url}")
 
-        # Метаданные: нормализованные фильтры + служебные поля
+        # Метаданные: фильтры + main_category + sub_category
+        sub_cat = p.category or ""
+        main_cat = CATEGORY_SLUG_MAP.get(sub_cat, "")
         metadata: dict[str, str] = {
             "article": p.article,
             "name": p.name,
-            "category": p.category or "",
+            "main_category": main_cat,
+            "category": sub_cat,
             "price": p.price or "",
             "url": p.url,
             "tags": ", ".join(p.tags),
