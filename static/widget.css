@@ -1,0 +1,312 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Виджет чат-бота ООО "Завод ВРК"
+   Самодостаточный CSS — не конфликтует со стилями сайта (BEM-именование).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.vrk-chat-btn {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 99999;
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    border: none;
+    background: linear-gradient(135deg, #1565c0, #0d47a1);
+    color: #fff;
+    cursor: pointer;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, .25);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform .2s, box-shadow .2s;
+}
+
+.vrk-chat-btn:hover {
+    transform: scale(1.08);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, .35);
+}
+
+.vrk-chat-btn svg {
+    width: 28px;
+    height: 28px;
+    fill: currentColor;
+}
+
+/* ─── Окно чата ─────────────────────────────────────────────────────────── */
+
+.vrk-chat-window {
+    position: fixed;
+    bottom: 96px;
+    right: 24px;
+    z-index: 99998;
+    width: 380px;
+    max-width: calc(100vw - 32px);
+    height: 560px;
+    max-height: calc(100vh - 120px);
+    border-radius: 16px;
+    background: #fff;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, .18);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.45;
+    opacity: 0;
+    transform: translateY(20px) scale(.95);
+    pointer-events: none;
+    transition: opacity .25s, transform .25s;
+}
+
+.vrk-chat-window--open {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    pointer-events: auto;
+}
+
+/* ─── Заголовок ─────────────────────────────────────────────────────────── */
+
+.vrk-chat-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 16px;
+    background: linear-gradient(135deg, #1565c0, #0d47a1);
+    color: #fff;
+}
+
+.vrk-chat-header__avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, .2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    flex-shrink: 0;
+}
+
+.vrk-chat-header__info {
+    flex: 1;
+    min-width: 0;
+}
+
+.vrk-chat-header__title {
+    font-weight: 600;
+    font-size: 15px;
+}
+
+.vrk-chat-header__subtitle {
+    font-size: 12px;
+    opacity: .8;
+}
+
+.vrk-chat-header__close {
+    background: none;
+    border: none;
+    color: #fff;
+    font-size: 22px;
+    cursor: pointer;
+    padding: 4px;
+    line-height: 1;
+    opacity: .7;
+    transition: opacity .15s;
+}
+
+.vrk-chat-header__close:hover {
+    opacity: 1;
+}
+
+/* ─── Область сообщений ─────────────────────────────────────────────────── */
+
+.vrk-chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    background: #f5f7fa;
+}
+
+.vrk-msg {
+    max-width: 85%;
+    padding: 10px 14px;
+    border-radius: 14px;
+    word-wrap: break-word;
+    white-space: pre-wrap;
+}
+
+.vrk-msg--bot {
+    align-self: flex-start;
+    background: #fff;
+    color: #333;
+    border: 1px solid #e0e4ea;
+    border-bottom-left-radius: 4px;
+}
+
+.vrk-msg--user {
+    align-self: flex-end;
+    background: #1565c0;
+    color: #fff;
+    border-bottom-right-radius: 4px;
+}
+
+.vrk-msg--typing {
+    align-self: flex-start;
+    background: #fff;
+    border: 1px solid #e0e4ea;
+    border-bottom-left-radius: 4px;
+    color: #999;
+    font-style: italic;
+}
+
+/* ─── Карточка товара ───────────────────────────────────────────────────── */
+
+.vrk-product-card {
+    background: #fff;
+    border: 1px solid #e0e4ea;
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-top: 6px;
+    align-self: flex-start;
+    max-width: 90%;
+}
+
+.vrk-product-card__name {
+    font-weight: 600;
+    font-size: 14px;
+    color: #1565c0;
+    margin-bottom: 6px;
+}
+
+.vrk-product-card__detail {
+    font-size: 13px;
+    color: #555;
+    margin-bottom: 3px;
+}
+
+.vrk-product-card__price {
+    font-weight: 700;
+    font-size: 15px;
+    color: #2e7d32;
+    margin: 6px 0;
+}
+
+.vrk-product-card__link {
+    display: inline-block;
+    padding: 6px 16px;
+    background: #1565c0;
+    color: #fff;
+    border-radius: 8px;
+    text-decoration: none;
+    font-size: 13px;
+    transition: background .15s;
+}
+
+.vrk-product-card__link:hover {
+    background: #0d47a1;
+}
+
+/* ─── Кнопки быстрого выбора ────────────────────────────────────────────── */
+
+.vrk-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 16px 8px;
+}
+
+.vrk-buttons__btn {
+    padding: 7px 14px;
+    background: #e8eef7;
+    color: #1565c0;
+    border: 1px solid #c5d4e8;
+    border-radius: 20px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background .15s, color .15s;
+    white-space: nowrap;
+}
+
+.vrk-buttons__btn:hover {
+    background: #1565c0;
+    color: #fff;
+    border-color: #1565c0;
+}
+
+/* ─── Поле ввода ────────────────────────────────────────────────────────── */
+
+.vrk-chat-input {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border-top: 1px solid #e0e4ea;
+    background: #fff;
+}
+
+.vrk-chat-input__field {
+    flex: 1;
+    padding: 10px 14px;
+    border: 1px solid #d0d5dd;
+    border-radius: 24px;
+    outline: none;
+    font-size: 14px;
+    font-family: inherit;
+    transition: border-color .15s;
+}
+
+.vrk-chat-input__field:focus {
+    border-color: #1565c0;
+}
+
+.vrk-chat-input__send {
+    width: 40px;
+    height: 40px;
+    border: none;
+    border-radius: 50%;
+    background: #1565c0;
+    color: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: background .15s;
+}
+
+.vrk-chat-input__send:hover {
+    background: #0d47a1;
+}
+
+.vrk-chat-input__send:disabled {
+    background: #b0bec5;
+    cursor: not-allowed;
+}
+
+.vrk-chat-input__send svg {
+    width: 18px;
+    height: 18px;
+    fill: currentColor;
+}
+
+/* ─── Адаптив ───────────────────────────────────────────────────────────── */
+
+@media (max-width: 480px) {
+    .vrk-chat-window {
+        bottom: 0;
+        right: 0;
+        width: 100vw;
+        height: 100vh;
+        max-height: 100vh;
+        border-radius: 0;
+    }
+
+    .vrk-chat-btn {
+        bottom: 16px;
+        right: 16px;
+    }
+}

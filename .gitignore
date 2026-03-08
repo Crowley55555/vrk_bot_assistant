@@ -201,3 +201,8 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Проект ВРК
+chroma_db/
+data/raw_products.json
+logs/*.log
