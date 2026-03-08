@@ -22,7 +22,10 @@ from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from config import (
+    AC_BASKET_SUBCAT_FILTER,
     CATEGORY_SLUG_MAP,
+    DISTRIBUTOR_SUBCAT_FILTER,
+    VENT_PARTS_SUBCAT_FILTER,
     FACADE_SERIES,
     FACADE_STEPS,
     FUNNEL_SCENARIOS,
@@ -625,7 +628,9 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
     subcats = session.get("allowed_subcats") or None
     if session.get("scenario_key") == "slot_grille" and subcats:
         subcats = _filter_slot_grille_subcats(subcats, session["active_filters"])
-    results = _search_with_fallback(query, session["active_filters"], scenario, subcats)
+    # Детали систем вентиляции (адаптеры и др.): больше результатов — в подкатегориях много позиций
+    n_results = 15 if session.get("scenario_key") == "vent_parts" else 8
+    results = _search_with_fallback(query, session["active_filters"], scenario, subcats, n_results=n_results)
 
     log.info(
         "Поиск | scenario=%s | filters=%s | subcats=%s | results=%d",
@@ -640,7 +645,9 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
         f"Клиент ищет: {query}. Подбери подходящие товары из контекста.",
         session_id, context,
     )
-    products = _product_data_list(results, n=5)
+    # Детали систем вентиляции: показываем до 10 карточек (адаптеры, КСД и др.)
+    n_products = 10 if session.get("scenario_key") == "vent_parts" else 5
+    products = _product_data_list(results, n=n_products)
     _reset_funnel(session_id)
     if products:
         return ChatResponse(
@@ -1147,6 +1154,21 @@ async def process_message(request: ChatRequest) -> ChatResponse:
 
             if chosen_value is not None:
                 session["active_filters"][current_step["step_id"]] = chosen_value
+
+                # Корзины для кондиционеров: фильтр по подкатегориям (корзины / экраны·панели / кронштейны)
+                if session.get("scenario_key") == "ac_basket" and current_step["step_id"] == "ac_type":
+                    all_ac = [s for s, c in CATEGORY_SLUG_MAP.items() if c == "ac_basket"]
+                    session["allowed_subcats"] = AC_BASKET_SUBCAT_FILTER.get(chosen_value, all_ac)
+
+                # Воздухораспределители: фильтр по типу (панельные / низкоскоростные / дисковые / для чистых помещений)
+                if session.get("scenario_key") == "distributor" and current_step["step_id"] == "distributor_type":
+                    all_dist = [s for s, c in CATEGORY_SLUG_MAP.items() if c == "distributor"]
+                    session["allowed_subcats"] = DISTRIBUTOR_SUBCAT_FILTER.get(chosen_value, all_dist)
+
+                # Детали систем вентиляции: фильтр по типу (адаптеры / шумоглушители / воздушные клапаны)
+                if session.get("scenario_key") == "vent_parts" and current_step["step_id"] == "part_type":
+                    all_vp = [s for s, c in CATEGORY_SLUG_MAP.items() if c == "vent_parts"]
+                    session["allowed_subcats"] = VENT_PARTS_SUBCAT_FILTER.get(chosen_value, all_vp)
 
                 if scenario.get("dynamic") and current_step["step_id"] == "location":
                     subcats = _filter_subcats_by_location(chosen_value)
