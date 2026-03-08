@@ -115,6 +115,32 @@ SLOT_GRILLE_SUBCAT_FILTER: dict[str, dict[str, str]] = {
     "shhelevye-resetki-i-diffuzory-s-vidimoi-dekorativnoi-ramkoi": {"slot_mount": "visible", "slot_ceiling_type": ""},
 }
 
+# Соответствие выбора «Что именно нужно?» (ac_type) → slug подкатегорий в каталоге ВРК.
+# Используется для фильтрации выдачи: корзины / экраны·панели / кронштейны — разные подкатегории.
+AC_BASKET_SUBCAT_FILTER: dict[str, list[str]] = {
+    "basket": ["korziny", "korziny-dlya-kondicionerov-na-fasad"],
+    "screen": ["ekrany", "paneli"],
+    "bracket": ["kronsteiny"],
+}
+
+# Соответствие типа воздухораспределителя → slug подкатегории в каталоге ВРК.
+# Воронка спрашивает тип (как на сайте), а не потолочный/настенный.
+DISTRIBUTOR_SUBCAT_FILTER: dict[str, list[str]] = {
+    "panel": ["panelnye-vozduxoraspredeliteli"],
+    "low_speed": ["nizkoskorostnye"],
+    "disk": ["diskovye"],
+    "clean_rooms": ["vozduxorazdaiushhie-bloki-dlia-cistyx-pomeshhenii"],
+}
+
+# Соответствие выбора «Что именно нужно?» (part_type) → slug подкатегорий в каталоге ВРК.
+# Адаптеры: две страницы — «Адаптеры для решеток» и общая «Детали систем вентиляции»
+# (там КСД для диффузоров, адаптеры VLM-F/VLM-G, THL и др.).
+VENT_PARTS_SUBCAT_FILTER: dict[str, list[str]] = {
+    "adapter": ["adaptery-dlya-reshetok", "detali-sistem-ventiliacii"],
+    "silencer": ["sumoglusiteli"],
+    "valve": ["vozdusnye-klapany"],
+}
+
 # ─── Парсер ────────────────────────────────────────────────────────────────────
 BASE_SITE_URL = "https://xn----ctbjabaraetfwdan0bzal0e5b4cwe.xn--p1ai"
 
@@ -606,11 +632,13 @@ FUNNEL_SCENARIOS: dict[str, dict] = {
         "auto_filters": {},
         "steps": [
             {
-                "step_id": "location",
-                "question": "Тип установки воздухораспределителя?",
+                "step_id": "distributor_type",
+                "question": "Какой тип воздухораспределителя вас интересует?",
                 "options": [
-                    {"label": "Потолочный", "filter_value": "indoor"},
-                    {"label": "Настенный", "filter_value": "indoor"},
+                    {"label": "Панельные воздухораспределители", "filter_value": "panel"},
+                    {"label": "Низкоскоростные", "filter_value": "low_speed"},
+                    {"label": "Дисковые", "filter_value": "disk"},
+                    {"label": "Воздухораздающие блоки для чистых помещений", "filter_value": "clean_rooms"},
                 ],
             },
             {
@@ -697,7 +725,7 @@ SYSTEM_PROMPT = """### РОЛЬ И КОНТЕКСТ
 2. Щелевые решетки (скрытого монтажа: в ГКЛ, под шпаклёвку, в натяжной потолок; с видимой рамкой)
 3. Диффузоры (потолочные, вихревые, сопловые, веерные и др.)
 4. Корзины для кондиционеров (корзины, экраны, кронштейны, панели)
-5. Воздухораспределители (панельные, дисковые, низкоскоростные)
+5. Воздухораспределители (панельные, низкоскоростные, дисковые, воздухораздающие блоки для чистых помещений)
 6. Детали систем вентиляции (адаптеры, шумоглушители, воздушные клапаны)
 ❌ Электроприводы и Фильтры — НЕ входят в ассортимент бота.
 
