@@ -35,6 +35,7 @@ from config import (
     MANAGER_CONTACTS,
     PRODUCT_TYPE_STEP,
     SALES_ARGS,
+    SLOT_GRILLE_SUBCAT_FILTER,
     SLOT_SERIES,
     SLOT_STEPS,
     STATIC_DIR,
@@ -148,6 +149,9 @@ def _activate_scenario(session_id: str, scenario_key: str) -> ChatResponse:
         session["allowed_subcats"] = [
             slug for slug, cat in CATEGORY_SLUG_MAP.items() if cat == "slot_grille"
         ]
+    else:
+        # Диффузоры, корзины, воздухораспределители, детали — фильтр по подкатегориям не нужен
+        session["allowed_subcats"] = []
 
     if not scenario["steps"]:
         return _do_filtered_search_sync(session_id, "")
@@ -249,7 +253,6 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
         if len(mount_opts) > 1:
             session["grille_phase"] = "mount"
             buttons = [ButtonOption(label=o["label"], value=o["value"]) for o in mount_opts]
-            buttons.append(ButtonOption(label="Не важно", value="any"))
             return ChatResponse(
                 reply=prefix + "Как будет выполнен монтаж решетки?",
                 action=ChatAction.ASK_QUESTION,
@@ -265,7 +268,6 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
         if len(feat_opts) > 1:
             session["grille_phase"] = "feature"
             buttons = [ButtonOption(label=o["label"], value=o["value"]) for o in feat_opts]
-            buttons.append(ButtonOption(label="Не важно", value="any"))
             return ChatResponse(
                 reply=prefix + "Какие требования к решетке?",
                 action=ChatAction.ASK_QUESTION,
@@ -463,11 +465,39 @@ async def _ask_llm(user_message: str, session_id: str, context: str) -> str:
 # ПОИСК С ФИЛЬТРАЦИЕЙ, ВАЛИДАЦИЕЙ И SUB_CATEGORY
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Ключи метаданных, которые реально хранятся в ChromaDB. В БД нет полей из шагов воронки:
+# slot_mount, slot_ceiling_type, ac_type, part_type, facade_* , indoor_* — они не попадают в where.
+METADATA_FILTER_KEYS = frozenset({"product_type", "location", "size_group", "material", "main_category"})
+
+
+def _filter_slot_grille_subcats(
+    allowed_subcats: list[str], active_filters: dict[str, str],
+) -> list[str]:
+    """Оставляет только slug подкатегорий щелевых, совпадающие с выбранным типом монтажа/установки."""
+    mount = active_filters.get("slot_mount")
+    ceiling = (active_filters.get("slot_ceiling_type") or "").strip()
+    if not mount:
+        return allowed_subcats
+    result = []
+    for slug in allowed_subcats:
+        rule = SLOT_GRILLE_SUBCAT_FILTER.get(slug)
+        if not rule or rule.get("slot_mount") != mount:
+            continue
+        if mount == "concealed" and ceiling and rule.get("slot_ceiling_type") != ceiling:
+            continue
+        result.append(slug)
+    return result if result else allowed_subcats
+
+
 def _build_where_filter(
     active_filters: dict[str, str],
     allowed_subcats: list[str] | None = None,
 ) -> dict | None:
-    conditions = [{k: {"$eq": v}} for k, v in active_filters.items() if v]
+    conditions = [
+        {k: {"$eq": v}}
+        for k, v in active_filters.items()
+        if v and k in METADATA_FILTER_KEYS
+    ]
     if allowed_subcats:
         conditions.append({"category": {"$in": allowed_subcats}})
     if not conditions:
@@ -478,8 +508,9 @@ def _build_where_filter(
 
 
 def _validate_product(meta: dict, active_filters: dict[str, str]) -> bool:
+    """Проверяет, что товар подходит под фильтры (учитываются только ключи из метаданных БД)."""
     for key, value in active_filters.items():
-        if not value:
+        if not value or key not in METADATA_FILTER_KEYS:
             continue
         product_value = meta.get(key, "")
         if product_value and product_value != value:
@@ -564,11 +595,36 @@ def _best_product_data(results: list[dict]) -> dict | None:
     }
 
 
+def _product_data_list(results: list[dict], n: int = 5) -> list[dict]:
+    """Возвращает до n карточек товаров для выдачи списком (каждый в отдельном сообщении)."""
+    out: list[dict] = []
+    seen_urls: set[str] = set()
+    for r in results[: n * 2]:
+        if len(out) >= n:
+            break
+        meta = r.get("metadata", {})
+        url = meta.get("url", "")
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        out.append({
+            "name": meta.get("name", ""),
+            "article": meta.get("article", ""),
+            "price": meta.get("price", ""),
+            "url": url,
+            "category": meta.get("category", ""),
+            "location": meta.get("location", ""),
+        })
+    return out
+
+
 async def _do_filtered_search(session_id: str, user_message: str) -> ChatResponse:
     session = _get_session(session_id)
     scenario = _get_scenario(session_id)
     query = user_message or _build_search_query(session_id)
     subcats = session.get("allowed_subcats") or None
+    if session.get("scenario_key") == "slot_grille" and subcats:
+        subcats = _filter_slot_grille_subcats(subcats, session["active_filters"])
     results = _search_with_fallback(query, session["active_filters"], scenario, subcats)
 
     log.info(
@@ -580,16 +636,21 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
     )
 
     context = _build_context(results)
-    llm_answer = await _ask_llm(
+    await _ask_llm(
         f"Клиент ищет: {query}. Подбери подходящие товары из контекста.",
         session_id, context,
     )
-    product_data = _best_product_data(results)
+    products = _product_data_list(results, n=5)
     _reset_funnel(session_id)
+    if products:
+        return ChatResponse(
+            reply="Вот решетки которые вам могут подойти:",
+            action=ChatAction.SHOW_PRODUCT,
+            products=products,
+        )
     return ChatResponse(
-        reply=llm_answer,
-        action=ChatAction.SHOW_PRODUCT if product_data else ChatAction.CONTACT_MANAGER,
-        product_data=product_data,
+        reply="Под заданные параметры товаров не найдено. Рекомендую связаться с менеджером для индивидуального подбора.",
+        action=ChatAction.CONTACT_MANAGER,
     )
 
 
@@ -829,12 +890,12 @@ def _next_detail_step(session_id: str) -> int | None:
     return None
 
 
-def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
+async def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
     """Задаёт следующий вопрос из детальной ветки или завершает поиском."""
     s = _get_session(session_id)
     idx = _next_detail_step(session_id)
     if idx is None:
-        return _detail_search(session_id)
+        return await _detail_search(session_id)
 
     s["detail_step_idx"] = idx
     s["funnel_phase"] = "detail"
@@ -920,16 +981,21 @@ async def _detail_search(session_id: str) -> ChatResponse:
     if recommendation:
         extra_context = f"\n\nРекомендация из ЧЕК-ЛИСТА менеджера:\n{recommendation}"
 
-    llm_answer = await _ask_llm(
+    await _ask_llm(
         f"Клиент ищет: {query}.{extra_context}\nПодбери товары из контекста.",
         session_id, context,
     )
-    product_data = _best_product_data(results)
+    products = _product_data_list(results, n=5)
     _reset_funnel(session_id)
+    if products:
+        return ChatResponse(
+            reply="Вот решетки которые вам могут подойти:",
+            action=ChatAction.SHOW_PRODUCT,
+            products=products,
+        )
     return ChatResponse(
-        reply=llm_answer,
-        action=ChatAction.SHOW_PRODUCT if product_data else ChatAction.CONTACT_MANAGER,
-        product_data=product_data,
+        reply="Под заданные параметры товаров не найдено. Рекомендую связаться с менеджером.",
+        action=ChatAction.CONTACT_MANAGER,
     )
 
 
@@ -983,7 +1049,7 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                 steps = _get_detail_steps(session["detail_branch"])
                 session["detail_answers"].pop(steps[idx - 1]["step_id"], None)
                 session["detail_step_idx"] = idx - 1
-                return _detail_ask(session_id)
+                return await _detail_ask(session_id)
             session["funnel_phase"] = "scenario"
             session["detail_branch"] = None
             session["detail_answers"] = {}
@@ -1053,7 +1119,7 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             if chosen is not None:
                 session["detail_answers"][step["step_id"]] = chosen
                 session["detail_step_idx"] = idx + 1
-                return _detail_ask(session_id)
+                return await _detail_ask(session_id)
 
     # ── Фаза: выбор категории ──
     if session["funnel_phase"] == "product_type":
@@ -1097,7 +1163,7 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                         session["detail_step_idx"] = 0
                         session["detail_answers"] = {}
                         prefix = SALES_ARGS.get("embedded_vs_surface", "")
-                        return _detail_ask(session_id, f"💡 {prefix}\n\n" if prefix else "")
+                        return await _detail_ask(session_id, f"💡 {prefix}\n\n" if prefix else "")
 
                     return _grille_advance(session_id)
 
@@ -1111,7 +1177,7 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                         session["detail_branch"] = "indoor"
                         session["detail_step_idx"] = 0
                         session["detail_answers"] = {}
-                        return _detail_ask(session_id)
+                        return await _detail_ask(session_id)
                     return _current_step_response(session_id)
 
                 # All scenario steps done
@@ -1120,7 +1186,7 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                     session["detail_branch"] = "indoor"
                     session["detail_step_idx"] = 0
                     session["detail_answers"] = {}
-                    return _detail_ask(session_id)
+                    return await _detail_ask(session_id)
 
                 return await _do_filtered_search(session_id, _build_search_query(session_id))
 
@@ -1226,12 +1292,12 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             session["detail_branch"] = "facade"
             session["detail_step_idx"] = 0
             session["detail_answers"] = {}
-            return _detail_ask(session_id)
+            return await _detail_ask(session_id)
         if sk == "grille" and loc == "indoor" and not session.get("detail_branch"):
             session["detail_branch"] = "indoor"
             session["detail_step_idx"] = 0
             session["detail_answers"] = {}
-            return _detail_ask(session_id)
+            return await _detail_ask(session_id)
 
         return await _do_filtered_search(session_id, message)
 
@@ -1272,13 +1338,14 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             buttons=_make_buttons(step_cfg),
         )
 
-    product_data = None
-    action = ChatAction.ASK_QUESTION
     if results and results[0]["distance"] < 0.7:
-        product_data = _best_product_data(results)
-        action = ChatAction.SHOW_PRODUCT
-
-    return ChatResponse(reply=llm_answer, action=action, product_data=product_data)
+        products = _product_data_list(results, n=5)
+        return ChatResponse(
+            reply="Вот решетки которые вам могут подойти:",
+            action=ChatAction.SHOW_PRODUCT,
+            products=products,
+        )
+    return ChatResponse(reply=llm_answer, action=ChatAction.ASK_QUESTION)
 
 
 # ─── API Endpoints ─────────────────────────────────────────────────────────────

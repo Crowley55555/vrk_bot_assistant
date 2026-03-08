@@ -106,6 +106,15 @@ CATEGORY_SLUG_MAP: dict[str, str] = {
     "vozdusnye-klapany":                      "vent_parts",
 }
 
+# Соответствие slug щелевых решёток → тип монтажа и установки (как на сайте).
+# Используется для фильтрации выдачи по подкатегориям «под шпаклёвку» / «в ГКЛ» / «в натяжной» / «с видимой рамкой».
+SLOT_GRILLE_SUBCAT_FILTER: dict[str, dict[str, str]] = {
+    "shhelevye-resetki-i-diffuzory-v-gipsokarton": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+    "shhelevye-resetki-i-diffuzory-skrytogo-montaza-pod-spaklevku": {"slot_mount": "concealed", "slot_ceiling_type": "plaster"},
+    "shhelevye-resetki-i-diffuzory-skrytogo-montaza-v-natyaznoi-potolok": {"slot_mount": "concealed", "slot_ceiling_type": "stretch"},
+    "shhelevye-resetki-i-diffuzory-s-vidimoi-dekorativnoi-ramkoi": {"slot_mount": "visible", "slot_ceiling_type": ""},
+}
+
 # ─── Парсер ────────────────────────────────────────────────────────────────────
 BASE_SITE_URL = "https://xn----ctbjabaraetfwdan0bzal0e5b4cwe.xn--p1ai"
 
@@ -493,7 +502,6 @@ FUNNEL_SCENARIOS: dict[str, dict] = {
                 "options": [
                     {"label": "На фасаде / улице", "filter_value": "outdoor"},
                     {"label": "Внутри помещения", "filter_value": "indoor"},
-                    {"label": "Не важно", "filter_value": ""},
                 ],
             },
             {
@@ -552,7 +560,6 @@ FUNNEL_SCENARIOS: dict[str, dict] = {
                 "question": "Где будет установлен диффузор?",
                 "options": [
                     {"label": "Внутри помещения (потолок / стена)", "filter_value": "indoor"},
-                    {"label": "Не важно", "filter_value": ""},
                 ],
             },
             {
@@ -604,7 +611,6 @@ FUNNEL_SCENARIOS: dict[str, dict] = {
                 "options": [
                     {"label": "Потолочный", "filter_value": "indoor"},
                     {"label": "Настенный", "filter_value": "indoor"},
-                    {"label": "Не важно", "filter_value": ""},
                 ],
             },
             {
@@ -656,7 +662,6 @@ FUNNEL_SCENARIOS: dict[str, dict] = {
                 "options": [
                     {"label": "Фасад / Улица", "filter_value": "outdoor"},
                     {"label": "Внутри помещения", "filter_value": "indoor"},
-                    {"label": "Не важно", "filter_value": ""},
                 ],
             },
             {
@@ -729,7 +734,9 @@ SYSTEM_PROMPT = """### РОЛЬ И КОНТЕКСТ
 
 # ─── Приветственное сообщение Telegram ─────────────────────────────────────────
 TELEGRAM_WELCOME_TEXT = (
-    'Вас приветствует бот ООО "Завод ВРК". '
-    "Я помогу вам выбрать продукцию нашего завода под ваши требования. "
-    "Нажмите Старт чтобы продолжить"
+    "Добро пожаловать!\n\n"
+    "Я — ВРК Pro, ваш умный ассистент по подбору вентиляционных решеток и комплектующих.\n\n"
+    "Помогу подобрать решение для вашего проекта за пару минут: "
+    "просто ответьте на несколько простых вопросов или напишите в чат.\n\n"
+    "Нажмите Старт чтобы продолжить."
 )

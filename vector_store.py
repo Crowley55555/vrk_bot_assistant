@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
 from typing import Optional
 
 import chromadb
@@ -22,6 +24,23 @@ log = get_logger(__name__)
 
 _client: Optional[chromadb.ClientAPI] = None
 _collection: Optional[chromadb.Collection] = None
+
+
+def reset_db() -> None:
+    """
+    Удаляет директорию ChromaDB и сбрасывает кэш подключения.
+    После вызова следующий get_collection() создаст новую БД.
+    Вызывайте при остановленном приложении, чтобы не держать открытые файлы.
+    """
+    global _client, _collection
+    _collection = None
+    _client = None
+    path = Path(CHROMA_PERSIST_DIR)
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+        log.info("ChromaDB: директория %s удалена", CHROMA_PERSIST_DIR)
+    else:
+        log.info("ChromaDB: директория %s не существовала", CHROMA_PERSIST_DIR)
 
 
 def _get_client() -> chromadb.ClientAPI:
@@ -91,13 +110,14 @@ def index_chunks(chunks: list[dict]) -> int:
 
 
 def remove_by_ids(article_ids: list[str]) -> int:
-    """Удаляет документы по списку артикулов."""
-    if not article_ids:
+    """Удаляет документы по списку артикулов (дубликаты убираются)."""
+    unique_ids = list(dict.fromkeys(article_ids))
+    if not unique_ids:
         return 0
     col = get_collection()
-    col.delete(ids=article_ids)
-    log.info("ChromaDB: удалено %d документов", len(article_ids))
-    return len(article_ids)
+    col.delete(ids=unique_ids)
+    log.info("ChromaDB: удалено %d документов", len(unique_ids))
+    return len(unique_ids)
 
 
 def reindex_all() -> int:

@@ -66,4 +66,5 @@ class ChatResponse(BaseModel):
     reply: str
     action: ChatAction = ChatAction.ASK_QUESTION
     product_data: Optional[dict] = None
+    products: Optional[list[dict]] = None  # несколько товаров — каждый в отдельном сообщении (Telegram)
     buttons: list[ButtonOption] = Field(default_factory=list)

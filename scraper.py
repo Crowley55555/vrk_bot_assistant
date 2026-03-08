@@ -25,6 +25,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from config import (
     BASE_SITE_URL,
     CATEGORY_SLUG_MAP,
+    MAIN_CATEGORIES,
     RAW_PRODUCTS_PATH,
     SCRAPER_MAX_RETRIES,
     SCRAPER_REQUEST_DELAY,
@@ -72,11 +73,12 @@ def _clean(text: str | None) -> str:
 
 
 def _content_hash(product: Product) -> str:
-    """MD5 от ключевых полей — для отслеживания изменений."""
+    """MD5 от ключевых полей — для отслеживания изменений (в т.ч. смена категории)."""
     blob = "|".join([
         product.name,
         product.price or "",
         product.description or "",
+        product.category or "",
         json.dumps(product.raw_attrs, sort_keys=True, ensure_ascii=False),
         json.dumps(product.filters, sort_keys=True, ensure_ascii=False),
     ])
@@ -465,6 +467,9 @@ async def scrape_all() -> list[Product]:
             for info in card_infos:
                 url = info["url"]
                 if url in all_products:
+                    # Товар уже добавлен с другой страницы каталога — обновляем категорию на текущую,
+                    # чтобы раздел каталога (щелевые, диффузоры и т.д.) определялся последним вхождением
+                    all_products[url].category = cat_name
                     continue
 
                 await asyncio.sleep(random.uniform(0.5, SCRAPER_REQUEST_DELAY))
@@ -619,6 +624,9 @@ def process_to_chunks(products: list[Product] | None = None) -> list[dict]:
             "tags": ", ".join(p.tags),
         }
         metadata.update(p.filters)
+        # Тип товара из раздела каталога: щелевые = slot_grille, иначе из названия мог бы быть grille/diffuser
+        if main_cat and main_cat in MAIN_CATEGORIES:
+            metadata["product_type"] = main_cat
         metadata["raw_attrs_json"] = json.dumps(p.raw_attrs, ensure_ascii=False)
 
         chunks.append({

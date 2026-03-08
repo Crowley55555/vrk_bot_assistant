@@ -36,6 +36,7 @@ from aiogram.types import (
 )
 
 from config import (
+    MANAGER_CONTACTS,
     PRODUCT_TYPE_STEP,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_WELCOME_TEXT,
@@ -126,39 +127,17 @@ async def _send_response(
     """
     Отправляет ответ бота в Telegram-чат.
 
-    - Если передан список products: вводное сообщение, затем каждый товар отдельным
-      сообщением с кнопкой «Открыть на сайте», в конце «Надеюсь я вам помог!» с Назад/Главное меню.
-    - Иначе: одно сообщение, при одном товаре — кнопка «Открыть на сайте», навигация.
+    - Голые URL удаляются из текста LLM (ссылка идёт кнопкой).
+    - Кнопка «🔗 Открыть на сайте» добавляется если есть product_data.url.
+    - Навигация «Назад» / «Главное меню» — на всех шагах кроме главного меню.
     """
     if isinstance(target, CallbackQuery):
         send = target.message.answer
     else:
         send = target.answer
 
-    # Выдача списка товаров: каждое сообщение отдельно
-    if response.products and len(response.products) > 0:
-        await send(
-            _strip_bare_urls(response.reply),
-            parse_mode=ParseMode.HTML,
-        )
-        for product in response.products:
-            card_text = _format_product_card(product)
-            url = product.get("url")
-            if url:
-                kb = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔗 Открыть на сайте", url=url)]
-                ])
-                await send(card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
-            else:
-                await send(card_text, parse_mode=ParseMode.HTML)
-        await send(
-            "Надеюсь я вам помог!",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[_NAV_ROW]),
-        )
-        return
-
-    # Обычное сообщение (один товар или без товара)
     text = _strip_bare_urls(response.reply)
+
     product_url = None
     if response.action == ChatAction.SHOW_PRODUCT and response.product_data:
         card = _format_product_card(response.product_data)
