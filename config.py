@@ -297,6 +297,15 @@ GRILLE_FEATURE_LABELS: dict[str, str] = {
 # ── Ветка «ФАСАД» ─────────────────────────────────────────────────────────────
 FACADE_STEPS: list[dict] = [
     {
+        "step_id": "facade_form",
+        "question": "Какая форма решётки нужна?",
+        "options": [
+            {"label": "Прямоугольные", "value": "rectangular"},
+            {"label": "Круглые", "value": "round"},
+            {"label": "Не важно", "value": ""},
+        ],
+    },
+    {
         "step_id": "facade_mount_type",
         "question": "Решетка встраиваемая или накладная?",
         "hint": (
@@ -307,6 +316,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Встраиваемая (с фланцем)", "value": "embedded"},
             {"label": "Накладная (без фланца)", "value": "surface"},
         ],
+        "applicable_when_not": {"facade_form": "round"},
     },
     {
         "step_id": "facade_size",
@@ -316,6 +326,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Более 2 м²", "value": "over_2m2"},
             {"label": "Более 4 м²", "value": "over_4m2"},
         ],
+        "applicable_when_not": {"facade_form": "round"},
     },
     {
         "step_id": "facade_construction",
@@ -325,6 +336,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Усиленная конструкция рамы", "value": "reinforced_frame"},
             {"label": "Усиленная рама + ламели", "value": "reinforced_full"},
         ],
+        "applicable_when_not": {"facade_form": "round"},
     },
     {
         "step_id": "facade_regulated",
@@ -334,6 +346,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Да, регулируемая", "value": "regulated"},
             {"label": "Инерционная (с обратным клапаном)", "value": "inertial"},
         ],
+        "applicable_when_not": {"facade_form": "round"},
     },
 ]
 
@@ -524,10 +537,20 @@ FUNNEL_SCENARIOS: dict[str, dict] = {
         "steps": [
             {
                 "step_id": "location",
-                "question": "Где будет установлена решетка: на фасаде или внутри помещения?",
+                "question": "Где будет установлена решетка: на фасаде, внутри помещения или в воздуховод?",
                 "options": [
                     {"label": "На фасаде / улице", "filter_value": "outdoor"},
                     {"label": "Внутри помещения", "filter_value": "indoor"},
+                    {"label": "В воздуховод", "filter_value": "duct"},
+                ],
+            },
+            {
+                "step_id": "material",
+                "question": "Какой материал решётки нужен?",
+                "options": [
+                    {"label": "Алюминий", "filter_value": "aluminum"},
+                    {"label": "Оцинкованная сталь", "filter_value": "galvanized"},
+                    {"label": "Нержавеющая сталь", "filter_value": "stainless_steel"},
                 ],
             },
             {

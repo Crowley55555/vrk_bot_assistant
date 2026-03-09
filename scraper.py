@@ -1,11 +1,11 @@
 """
-Умный парсер каталога ООО "Завод ВРК".
+Парсер каталога ООО "Завод ВРК".
 
-- Обходит страницы категорий, собирает ссылки на карточки товаров.
-- Переходит на каждую карточку (Deep Crawl), извлекает полный набор данных,
-  включая ВСЕ пары ключ-значение из блока характеристик (card1_attrs).
-- Нормализует сырые характеристики в строгие фильтры (material, location,
-  product_type, size_group) для Metadata Filtering в ChromaDB.
+- Характеристики берутся только из карточек товаров, только из класса items4_attrs (все пары).
+- Со страницы товара берутся только: описание (div.block_tab.text1), ссылка и цена.
+- Сценарий воронки синхронизирован с этими характеристиками (Материал, Место применения, Форма и т.д.).
+- При сохранении в БД чанки сортируются по пути сценария и получают scenario_block,
+  чтобы при прохождении сценария поиск шёл только в нужном блоке базы.
 - Реализует инкрементальное обновление (Delta Update).
 """
 
@@ -96,18 +96,30 @@ def _abs_url(href: str) -> str:
 # НОРМАЛИЗАЦИЯ АТРИБУТОВ → ФИЛЬТРЫ
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_MATERIAL_METAL_KW = [
-    "нержавеющая сталь", "нержавейка", "оцинковка", "оцинкованная сталь",
-    "алюминий", "сталь", "металл", "латунь", "медь",
-]
+# Порядок проверки важен: сначала уточнённые материалы, потом общий metal
+_MATERIAL_STAINLESS_KW = ["нержавеющая сталь", "нержавейка", "нержав"]
+_MATERIAL_GALVANIZED_KW = ["оцинковка", "оцинкованная сталь", "оцинкован"]
+_MATERIAL_ALUMINUM_KW = ["алюминий", "алюминиев"]
+_MATERIAL_METAL_OTHER_KW = ["сталь", "металл", "латунь", "медь"]
 _MATERIAL_PLASTIC_KW = ["пластик", "пвх", "полипропилен", "abs", "полистирол"]
 _MATERIAL_WOOD_KW = ["дерево", "деревянный", "мдф", "шпон"]
 
 
 def _normalize_material(raw_value: str) -> str:
-    """Маппинг сырого значения материала в код фильтра."""
+    """Маппинг сырого значения материала в код фильтра: aluminum, galvanized, stainless_steel, metal, plastic, wood, unknown."""
+    if not raw_value or not raw_value.strip():
+        return "unknown"
     lower = raw_value.lower()
-    for kw in _MATERIAL_METAL_KW:
+    for kw in _MATERIAL_STAINLESS_KW:
+        if kw in lower:
+            return "stainless_steel"
+    for kw in _MATERIAL_GALVANIZED_KW:
+        if kw in lower:
+            return "galvanized"
+    for kw in _MATERIAL_ALUMINUM_KW:
+        if kw in lower:
+            return "aluminum"
+    for kw in _MATERIAL_METAL_OTHER_KW:
         if kw in lower:
             return "metal"
     for kw in _MATERIAL_PLASTIC_KW:
@@ -164,6 +176,8 @@ def _normalize_product_type(name: str, category: str | None) -> str:
 
 
 _SIZE_RE = re.compile(r"(\d+)\s*[×хxXХ]\s*(\d+)")
+# Число (диаметр в мм): из значения вида «315», «200 мм», «Ø 400»
+_DIAMETER_NUM_RE = re.compile(r"\d{2,4}")
 
 
 def _normalize_size_group(name: str, raw_attrs: dict[str, str]) -> str:
@@ -176,12 +190,54 @@ def _normalize_size_group(name: str, raw_attrs: dict[str, str]) -> str:
     return "unknown"
 
 
+def _normalize_round_diameter_group(raw_attrs: dict[str, str], name: str) -> str:
+    """
+    Для круглых решёток: группа по диаметру (мм).
+    under_315 — до 315 мм, under_500 — до 500 мм, over_500 — более 500 мм.
+    Ищет диаметр в полях «Диаметр», «Размер», в названии (Ø 200, 315 мм и т.п.).
+    """
+    # Приоритет: явное поле Диаметр, затем Размер/Размеры, затем весь текст
+    for key in ("Диаметр", "Размер", "Размеры"):
+        val = raw_attrs.get(key, "").strip()
+        if val:
+            nums = [int(n) for n in _DIAMETER_NUM_RE.findall(val) if 50 <= int(n) <= 2000]
+            if nums:
+                d = max(nums)
+                if d <= 315:
+                    return "under_315"
+                if d <= 500:
+                    return "under_500"
+                return "over_500"
+    search_text = name + " " + " ".join(raw_attrs.values())
+    for m in _DIAMETER_NUM_RE.finditer(search_text):
+        d = int(m.group(0))
+        if 50 <= d <= 2000:
+            if d <= 315:
+                return "under_315"
+            if d <= 500:
+                return "under_500"
+            return "over_500"
+    return "unknown"
+
+
+def _normalize_regulated(raw_value: str) -> str | None:
+    """Маппинг характеристики Регулируемая/Нерегулируемая в код фильтра (regulated / fixed)."""
+    if not raw_value or not raw_value.strip():
+        return None
+    lower = raw_value.lower().strip()
+    if "регулируем" in lower and "нерегулируем" not in lower:
+        return "regulated"
+    if "нерегулируем" in lower:
+        return "fixed"
+    return None
+
+
 def _build_filters(raw_attrs: dict[str, str], name: str, category: str | None) -> dict[str, str]:
     """
     Собирает нормализованные фильтры из сырых характеристик товара.
 
     Обрабатывает ВСЕ найденные характеристики, маппит ключевые поля
-    (Материал, Место применения) в строгие кодовые значения.
+    (Материал, Место применения, Регулируемая/Нерегулируемая) в строгие кодовые значения.
     """
     filters: dict[str, str] = {}
 
@@ -191,8 +247,37 @@ def _build_filters(raw_attrs: dict[str, str], name: str, category: str | None) -
     loc_raw = raw_attrs.get("Место применения", "") or raw_attrs.get("Исполнение", "")
     filters["location"] = _normalize_location(loc_raw) if loc_raw else "unknown"
 
+    # Регулируемая/Нерегулируемая — по характеристике с сайта; если не указано — считаем нерегулируемой
+    regulated_raw = (
+        raw_attrs.get("Регулируемая/Нерегулируемая", "")
+        or raw_attrs.get("Регулировка", "")
+        or raw_attrs.get("Тип регулировки", "")
+    )
+    regulated = _normalize_regulated(regulated_raw)
+    filters["regulated"] = regulated if regulated else "fixed"
+
+    # Форма решётки (для фильтра в сценариях «На фасад», «В воздуховод»)
+    form_raw = raw_attrs.get("Форма", "").strip().lower()
+    all_text = (name + " " + " ".join(raw_attrs.values())).lower()
+    if "прямоуголь" in form_raw:
+        filters["form"] = "rectangular"
+    elif "кругл" in form_raw:
+        filters["form"] = "round"
+    elif "квадрат" in form_raw:
+        filters["form"] = "square"
+    elif "цилиндр" in form_raw:
+        filters["form"] = "cylindrical"
+    elif form_raw:
+        filters["form"] = form_raw[:50]  # иные значения как есть (нормализуем длину)
+    elif "кругл" in all_text and _normalize_product_type(name, category) == "grille":
+        # Круглые решётки: если в названии/атрибутах есть «кругл», а «Форма» на карточке пусто
+        filters["form"] = "round"
+
     filters["product_type"] = _normalize_product_type(name, category)
     filters["size_group"] = _normalize_size_group(name, raw_attrs)
+    # Круглые решётки: группа по диаметру (до 315 / до 500 / более 500 мм) для фильтра в сценарии
+    if filters.get("form") == "round":
+        filters["round_diameter_group"] = _normalize_round_diameter_group(raw_attrs, name)
 
     return filters
 
@@ -240,6 +325,7 @@ def _parse_category_page(html: str, category_name: str) -> list[dict]:
         article = ""
         price: Optional[str] = None
         tags: list[str] = []
+        card_attrs: dict[str, str] = {}
         card = a_tag.find_parent(["div", "article", "li", "section"])
         if card:
             card_text = card.get_text()
@@ -252,6 +338,10 @@ def _parse_category_page(html: str, category_name: str) -> list[dict]:
             for label in ("Хит", "Акция", "Советуем", "Новинка"):
                 if label in card_text:
                     tags.append(label)
+            # Характеристики только из блока items4_attrs на карточке каталога (все пары ключ-значение)
+            items4_block = card.select_one("[class*='items4_attrs']") or card.select_one(".items4_attrs")
+            if items4_block:
+                card_attrs = _parse_items4_attrs(items4_block)
 
         items.append({
             "url": url,
@@ -260,6 +350,7 @@ def _parse_category_page(html: str, category_name: str) -> list[dict]:
             "price": price,
             "category": category_name,
             "tags": tags,
+            "card_attrs": card_attrs,
         })
 
     return items
@@ -267,60 +358,52 @@ def _parse_category_page(html: str, category_name: str) -> list[dict]:
 
 # ─── Парсинг блока характеристик ───────────────────────────────────────────────
 
-def _parse_card_attrs(soup: BeautifulSoup) -> dict[str, str]:
+def _parse_items4_attrs(block: BeautifulSoup) -> dict[str, str]:
     """
-    Извлекает ВСЕ пары ключ-значение из блока характеристик товара.
-
-    Пробует три источника (в порядке приоритета):
-    1. div.card1_attrs_wrap — sidebar карточки
-    2. div.card_attrs — вкладка «Характеристики»
-    3. Текстовый поиск заголовка «Характеристики» — универсальный fallback
-
-    Количество пар может быть любым (2, 3, 5, …) — берём всё, что есть.
+    Извлекает ВСЕ пары ключ-значение из блока items4_attrs (характеристики на карточке).
+    На сайте ВРК ключ и значение в двух span, в двух div или в тексте «Ключ: Значение».
+    Сценарий воронки синхронизирован с этими атрибутами (Материал, Место применения, Форма и т.д.).
     """
     attrs: dict[str, str] = {}
-
-    # Способ 1: sidebar (card1_attrs_wrap > card1_attr)
-    wrap = soup.select_one("div.card1_attrs_wrap")
-    if wrap:
-        for row in wrap.select("div.card1_attr"):
-            key_el = row.select_one("span.card1_attr_title")
-            val_el = row.select_one("span.card1_attr_value")
-            if key_el and val_el:
-                k = _clean(key_el.get_text()).rstrip(":—– \t")
-                v = _clean(val_el.get_text())
+    if not block:
+        return attrs
+    # Строки: div/li/tr с двумя span или текст «Ключ: Значение»
+    for row in block.select("div, li, tr"):
+        spans = row.select("span")
+        if len(spans) >= 2:
+            k = _clean(spans[0].get_text()).rstrip(":—– \t")
+            v = _clean(spans[1].get_text())
+            if k and v:
+                attrs[k] = v
+        else:
+            text = _clean(row.get_text())
+            if ":" in text:
+                parts = text.split(":", 1)
+                k = parts[0].strip()
+                v = parts[1].strip() if len(parts) > 1 else ""
                 if k and v:
                     attrs[k] = v
-        if attrs:
-            return attrs
-
-    # Способ 2: вкладка (card_attrs > ul > li)
-    card_attrs_div = soup.select_one("div.card_attrs")
-    if card_attrs_div:
-        for li in card_attrs_div.select("ul li"):
-            key_el = li.select_one("div.attr_title")
-            val_el = li.select_one("div.attr_value")
-            if key_el and val_el:
-                k = _clean(key_el.get_text()).rstrip(":—– \t")
-                v = _clean(val_el.get_text())
-                if k and v:
+    # Добираем по строкам текста блока («Ключ:» + следующая строка или «Ключ: Значение»)
+    if not attrs:
+        lines = block.get_text().replace("\r", "\n").split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.endswith(":") and len(line) < 80:
+                k = line.rstrip(":—– \t").strip()
+                v = _clean(lines[i + 1]) if i + 1 < len(lines) else ""
+                if k and v and k not in ("Цена", "код", "Арт"):
                     attrs[k] = v
-        if attrs:
-            return attrs
-
-    # Способ 3: универсальный fallback по тексту «Характеристики»
-    header = soup.find(string=re.compile(r"Характеристики", re.I))
-    if header:
-        parent = header.find_parent(["div", "section", "table"])
-        if parent:
-            for row in parent.find_all(["tr", "li", "div"]):
-                cells = row.find_all(["td", "th", "span", "dt", "dd"])
-                if len(cells) >= 2:
-                    k = _clean(cells[0].get_text()).rstrip(":—– \t")
-                    v = _clean(cells[1].get_text())
-                    if k and v and k.lower() != "характеристики":
-                        attrs[k] = v
-
+                i += 2
+            elif ":" in line and len(line) < 150:
+                parts = line.split(":", 1)
+                k = parts[0].strip()
+                v = parts[1].strip() if len(parts) > 1 else ""
+                if k and v and k not in ("Цена", "код", "Арт"):
+                    attrs[k] = v
+                i += 1
+            else:
+                i += 1
     return attrs
 
 
@@ -378,8 +461,8 @@ def _parse_description(soup: BeautifulSoup) -> str | None:
 
 def _parse_product_page(html: str, base_info: dict) -> Product:
     """
-    Deep Crawl: со страницы товара извлекает полные данные,
-    включая все характеристики и нормализованные фильтры.
+    Со страницы товара берём только: описание (div.block_tab.text1), ссылку и цену.
+    Характеристики — только из карточек каталога (items4_attrs), со страницы не парсим.
     """
     soup = BeautifulSoup(html, "lxml")
 
@@ -387,7 +470,7 @@ def _parse_product_page(html: str, base_info: dict) -> Product:
     h1 = soup.find("h1")
     name = _clean(h1.get_text()) if h1 else base_info.get("name", "")
 
-    # Артикул
+    # Артикул (из карточки или со страницы)
     article = base_info.get("article", "")
     if not article:
         art_el = soup.find(string=re.compile(r"(Артикул|Арт\.|код)"))
@@ -400,33 +483,32 @@ def _parse_product_page(html: str, base_info: dict) -> Product:
         if m:
             article = m.group(1)
 
-    # Описание (из вкладки «Описание» / block_tab)
+    # Описание — только из div.block_tab.text1
     description = _parse_description(soup)
 
-    # ── Характеристики (все пары ключ-значение) ──
-    raw_attrs = _parse_card_attrs(soup)
+    # Характеристики только с карточки каталога (items4_attrs), со страницы не берём
+    raw_attrs = base_info.get("card_attrs") or {}
 
-    # ── Нормализованные фильтры ──
+    # Нормализованные фильтры под сценарий (из raw_attrs карточки)
     category = base_info.get("category", "")
     filters = _build_filters(raw_attrs, name, category)
 
-    # Цена
+    # Ссылка — из карточки
+    url = base_info["url"]
+
+    # Цена — с карточки или со страницы
     price = base_info.get("price")
     if not price:
         price_el = soup.find(string=re.compile(r"\d[\d\s]*[₽Р]"))
         if price_el:
             price = _clean(str(price_el))
 
-    # Старая цена
     old_price: Optional[str] = None
-    old_tag = soup.find(class_=re.compile(r"old.?price|price.?old|crossed"))
-    if old_tag:
-        old_price = _clean(old_tag.get_text())
 
     product = Product(
-        article=article or hashlib.md5(base_info["url"].encode()).hexdigest()[:8],
+        article=article or hashlib.md5(url.encode()).hexdigest()[:8],
         name=name,
-        url=base_info["url"],
+        url=url,
         price=price,
         old_price=old_price,
         description=description,
@@ -444,9 +526,10 @@ def _parse_product_page(html: str, base_info: dict) -> Product:
 async def scrape_all() -> list[Product]:
     """
     Полный цикл Deep Crawl:
-    1. Обходит все категории из START_URLS.
+    1. Обходит все категории из START_URLS (данные парсятся и сохраняются по категориям).
     2. Собирает ссылки на карточки товаров.
     3. Загружает каждую карточку и извлекает данные + характеристики + фильтры.
+    У каждого товара сохраняется поле category (slug страницы каталога).
     """
     all_products: dict[str, Product] = {}
 
@@ -570,17 +653,33 @@ async def run_delta_update() -> dict[str, list[str]]:
 
 # ─── Чанкирование для векторной БД ────────────────────────────────────────────
 
+def _scenario_block_from_filters(filters: dict[str, str], main_cat: str) -> str:
+    """
+    Строит идентификатор «блока» сценария для быстрого поиска по воронке.
+    Совпадает с порядком шагов сценария: product_type → location → size_group [→ form для фасада].
+    Решётки с формой «Цилиндрические» попадают в блок grille_duct_* (сценарий «В воздуховод»).
+    """
+    pt = filters.get("product_type") or main_cat or "other"
+    loc = filters.get("location") or "unknown"
+    sg = filters.get("size_group") or "unknown"
+    form = (filters.get("form") or "").strip()
+    if pt == "grille":
+        if form == "cylindrical":
+            loc = "duct"
+        block = f"grille_{loc}_{sg}"
+        if loc == "outdoor" and form:
+            block += f"_{form}"
+        return block
+    if pt == "slot_grille":
+        return f"slot_grille_{loc}_{sg}"
+    return f"{pt}_{loc}_{sg}"
+
+
 def process_to_chunks(products: list[Product] | None = None) -> list[dict]:
     """
     Превращает список товаров в текстовые чанки для ChromaDB.
-
-    Каждый чанк содержит:
-    - id: уникальный идентификатор (артикул)
-    - text: человекочитаемый текст для эмбеддинга
-    - metadata: нормализованные фильтры + служебные поля для where-clause
-
-    Метаданные включают main_category (одна из 6 активных),
-    sub_category (slug из URL), а также фильтры location, product_type, size_group.
+    Чанки сортируются по пути сценария (product_type → location → size_group → form),
+    чтобы при поиске по сценарию LLM шла в нужный блок базы.
     """
     if products is None:
         existing = _load_existing()
@@ -611,7 +710,6 @@ def process_to_chunks(products: list[Product] | None = None) -> list[dict]:
             text_parts.append(f"Описание: {p.description[:3000]}")
         text_parts.append(f"Ссылка: {p.url}")
 
-        # Метаданные: фильтры + main_category + sub_category
         sub_cat = p.category or ""
         main_cat = CATEGORY_SLUG_MAP.get(sub_cat, "")
         metadata: dict[str, str] = {
@@ -624,9 +722,9 @@ def process_to_chunks(products: list[Product] | None = None) -> list[dict]:
             "tags": ", ".join(p.tags),
         }
         metadata.update(p.filters)
-        # Тип товара из раздела каталога: щелевые = slot_grille, иначе из названия мог бы быть grille/diffuser
         if main_cat and main_cat in MAIN_CATEGORIES:
             metadata["product_type"] = main_cat
+        metadata["scenario_block"] = _scenario_block_from_filters(metadata, main_cat)
         metadata["raw_attrs_json"] = json.dumps(p.raw_attrs, ensure_ascii=False)
 
         chunks.append({
@@ -635,5 +733,16 @@ def process_to_chunks(products: list[Product] | None = None) -> list[dict]:
             "metadata": metadata,
         })
 
-    log.info("Создано %d чанков для векторной БД (дедуплицировано)", len(chunks))
+    # Сортировка как в сценарии: тип → место → размер → форма
+    chunks.sort(
+        key=lambda c: (
+            c["metadata"].get("product_type", ""),
+            c["metadata"].get("location", ""),
+            c["metadata"].get("size_group", ""),
+            c["metadata"].get("form", ""),
+            c["metadata"].get("category", ""),
+        )
+    )
+
+    log.info("Создано %d чанков для векторной БД (отсортировано по сценарию)", len(chunks))
     return chunks

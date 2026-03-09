@@ -15,6 +15,9 @@ langchain-chroma>=0.2
 # GigaChat (Сбер)
 gigachat
 
+# Yandex GPT
+yandexcloud
+
 # ─── Векторная БД ──────────────────────────────────────────────────────────
 chromadb
 

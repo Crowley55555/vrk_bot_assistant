@@ -121,7 +121,16 @@ def _goto_main_menu(session_id: str) -> ChatResponse:
 
 def _current_step_response(session_id: str) -> ChatResponse:
     session = _get_session(session_id)
-    step = _get_scenario(session_id)["steps"][session["step_idx"]]
+    scenario = _get_scenario(session_id)
+    steps = scenario["steps"]
+    idx = session["step_idx"]
+    if idx >= len(steps):
+        session["step_idx"] = max(0, len(steps) - 1)
+        idx = session["step_idx"]
+    if idx < 0:
+        session["step_idx"] = 0
+        idx = 0
+    step = steps[idx]
     return ChatResponse(
         reply=step["question"],
         action=ChatAction.ASK_QUESTION,
@@ -318,6 +327,13 @@ def _grille_handle_answer(session_id: str, message: str) -> ChatResponse:
     if phase == "feature":
         subcats = _filter_subcats_by_feature(session["allowed_subcats"], message)
         session["allowed_subcats"] = subcats
+        # Фильтр по характеристике с сайта: только Регулируемые или только Нерегулируемые
+        if message == "adjustable":
+            session["active_filters"]["regulated"] = "regulated"
+        elif message == "fixed":
+            session["active_filters"]["regulated"] = "fixed"
+        else:
+            session["active_filters"].pop("regulated", None)
         session["grille_phase"] = "feature_done"
         return _grille_advance(session_id)
 
@@ -341,6 +357,7 @@ def _grille_back(session_id: str) -> ChatResponse:
             return _current_step_response(session_id)
 
         if prev_step == "feature":
+            session["active_filters"].pop("regulated", None)
             session["grille_phase"] = "mount_done"
             if routing and routing[-1]["step"] == "mount":
                 session["grille_phase"] = "mount"
@@ -468,9 +485,36 @@ async def _ask_llm(user_message: str, session_id: str, context: str) -> str:
 # ПОИСК С ФИЛЬТРАЦИЕЙ, ВАЛИДАЦИЕЙ И SUB_CATEGORY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Ключи метаданных, которые реально хранятся в ChromaDB. В БД нет полей из шагов воронки:
-# slot_mount, slot_ceiling_type, ac_type, part_type, facade_* , indoor_* — они не попадают в where.
-METADATA_FILTER_KEYS = frozenset({"product_type", "location", "size_group", "material", "main_category"})
+# Ключи метаданных, которые реально хранятся в ChromaDB и попадают в where.
+# Шаги воронки (slot_mount, ac_type, part_type, facade_* и т.д.) в where не идут —
+# они только задают allowed_subcats. Сопоставление по сценариям: docs/SCENARIOS_FILTERS.md
+METADATA_FILTER_KEYS = frozenset({
+    "product_type", "location", "size_group", "material", "main_category",
+    "regulated", "form", "scenario_block", "round_diameter_group",
+})
+
+
+def _get_scenario_block(active_filters: dict[str, str]) -> str | None:
+    """
+    Строит идентификатор блока сценария (как в scraper), чтобы искать только в нужном блоке БД.
+    Возвращает None, если по фильтрам блок однозначно не определяется.
+    """
+    pt = active_filters.get("product_type") or ""
+    loc = active_filters.get("location") or ""
+    sg = active_filters.get("size_group") or ""
+    form = (active_filters.get("form") or "").strip()
+    if not pt or not sg:
+        return None
+    if loc == "duct":
+        return f"grille_duct_{sg}" if pt == "grille" else f"{pt}_{loc}_{sg}"
+    if pt == "grille":
+        block = f"grille_{loc}_{sg}"
+        if loc == "outdoor" and form:
+            block += f"_{form}"
+        return block
+    if pt == "slot_grille":
+        return f"slot_grille_{loc}_{sg}" if loc else None
+    return f"{pt}_{loc}_{sg}"
 
 
 def _filter_slot_grille_subcats(
@@ -496,11 +540,23 @@ def _build_where_filter(
     active_filters: dict[str, str],
     allowed_subcats: list[str] | None = None,
 ) -> dict | None:
-    conditions = [
-        {k: {"$eq": v}}
-        for k, v in active_filters.items()
-        if v and k in METADATA_FILTER_KEYS
-    ]
+    conditions = []
+    # Поиск в нужном блоке сценария: один фильтр по scenario_block сужает выборку
+    scenario_block = _get_scenario_block(active_filters)
+    if scenario_block:
+        conditions.append({"scenario_block": {"$eq": scenario_block}})
+    for k, v in active_filters.items():
+        if not v or k not in METADATA_FILTER_KEYS:
+            continue
+        if k == "scenario_block":
+            continue  # уже добавлен выше
+        # «Нерегулируемая»: в where не добавляем (в выборку попадут и без характеристики), отбор — в _validate_product
+        if k == "regulated" and v == "fixed":
+            continue
+        # «В воздуховод»: по location в метаданных не фильтруем, только по form=cylindrical
+        if k == "location" and v == "duct":
+            continue
+        conditions.append({k: {"$eq": v}})
     if allowed_subcats:
         conditions.append({"category": {"$in": allowed_subcats}})
     if not conditions:
@@ -515,7 +571,28 @@ def _validate_product(meta: dict, active_filters: dict[str, str]) -> bool:
     for key, value in active_filters.items():
         if not value or key not in METADATA_FILTER_KEYS:
             continue
-        product_value = meta.get(key, "")
+        product_value = meta.get(key, "") or ""
+        # Регулируемая: только товары, у которых в характеристиках явно указано «Регулируемая».
+        # Нерегулируемая: товары с «Нерегулируемая» или без указания регулировки (считаем нерегулируемыми).
+        if key == "regulated":
+            if value == "regulated":
+                if (product_value or "").strip() != "regulated":
+                    return False  # только явно регулируемые
+            else:  # value == "fixed"
+                if product_value and product_value not in ("", "fixed"):
+                    return False  # исключаем только явно регулируемые
+            continue
+        # Форма: только товары с выбранной формой в характеристиках
+        if key == "form":
+            if (product_value or "").strip() != value:
+                return False
+            continue
+        # «В воздуховод»: в метаданных по location не фильтруем
+        if key == "location" and value == "duct":
+            continue
+        # scenario_block — производный, не проверяем по полю
+        if key == "scenario_block":
+            continue
         if product_value and product_value != value:
             return False
     return True
@@ -535,9 +612,15 @@ def _search_with_fallback(
         return validated
 
     relaxable = {k: v for k, v in active_filters.items() if v}
+    # Круглые решётки: form и regulated не сбрасываем при fallback — иначе в выдачу попадут все подряд
+    never_relax = set()
+    if active_filters.get("form") == "round":
+        never_relax = {"form", "regulated"}
     step_ids = list(reversed([s["step_id"] for s in scenario.get("steps", [])]))
 
     for key_to_relax in step_ids:
+        if key_to_relax in never_relax:
+            continue
         if key_to_relax in relaxable:
             relaxable.pop(key_to_relax)
             relaxed = _build_where_filter(relaxable, allowed_subcats)
@@ -553,6 +636,18 @@ def _search_with_fallback(
         if results:
             log.info("Fallback: убраны subcategory фильтры, найдено %d", len(results))
             return results
+
+    # Круглые: никогда не возвращать «любые» решётки — только с form=round или пусто
+    if active_filters.get("form") == "round":
+        minimal_where = {"$and": [
+            {"form": {"$eq": "round"}},
+            {"product_type": {"$eq": "grille"}},
+        ]}
+        results = search(query, n_results=n_results, where=minimal_where)
+        validated = [r for r in results if _validate_product(r.get("metadata", {}), active_filters)]
+        if validated:
+            return validated
+        return []
 
     raw = search(query, n_results=n_results)
     pt = active_filters.get("product_type", "")
@@ -631,12 +726,11 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
     # Детали систем вентиляции (адаптеры и др.): больше результатов — в подкатегориях много позиций
     n_results = 15 if session.get("scenario_key") == "vent_parts" else 8
     results = _search_with_fallback(query, session["active_filters"], scenario, subcats, n_results=n_results)
-
     log.info(
         "Поиск | scenario=%s | filters=%s | subcats=%s | results=%d",
         session.get("scenario_key", "?"),
         session["active_filters"],
-        subcats[:3] if subcats else "all",
+        subcats[:5] if subcats else "all",
         len(results),
     )
 
@@ -875,7 +969,14 @@ def _get_detail_steps(branch: str) -> list[dict]:
 
 
 def _detail_step_applicable(step: dict, answers: dict) -> bool:
-    """Проверяет condition шага — пропускает, если условие не выполнено."""
+    """Проверяет condition шага и applicable_when_not — шаг пропускается, если не применим."""
+    # Шаг показываем только когда НЕТ ответа из applicable_when_not (для круглых скрываем mount/construction/regulated)
+    skip_if = step.get("applicable_when_not")
+    if skip_if:
+        for key, skip_val in skip_if.items():
+            if answers.get(key) == skip_val:
+                return False
+    # Шаг показываем только когда condition выполнен (напр. facade_material только при form=round)
     cond = step.get("condition")
     if not cond:
         return True
@@ -907,12 +1008,17 @@ async def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
     s["detail_step_idx"] = idx
     s["funnel_phase"] = "detail"
     step = _get_detail_steps(s["detail_branch"])[idx]
+    options = step.get("options", [])
+    answers = s.get("detail_answers", {})
+    # Для накладной решётки регулируемых в ассортименте нет — не показываем опцию «Да, регулируемая»
+    if step["step_id"] == "facade_regulated" and answers.get("facade_mount_type") == "surface":
+        options = [o for o in options if (o.get("value") or o.get("label")) != "regulated"]
     buttons = [
         ButtonOption(
             label=opt["label"],
             value=opt.get("value") or opt["label"],
         )
-        for opt in step.get("options", [])
+        for opt in options
     ]
 
     hint = step.get("hint", "")
@@ -974,6 +1080,54 @@ def _recommend_series(session_id: str) -> str:
 async def _detail_search(session_id: str) -> ChatResponse:
     """Выполняет поиск после завершения детальной ветки."""
     s = _get_session(session_id)
+    # Подставляем в active_filters ответы из детальной ветки, используемые в метаданных ChromaDB
+    if s.get("detail_branch") == "facade":
+        answers = s.get("detail_answers") or {}
+        regulated_val = answers.get("facade_regulated", "")
+
+        # Регулируемых накладных решёток в ассортименте нет — сразу ответ без поиска
+        if answers.get("facade_mount_type") == "surface" and regulated_val == "regulated":
+            _reset_funnel(session_id)
+            return ChatResponse(
+                reply=(
+                    "Регулируемых накладных решёток в ассортименте нет. "
+                    "Рекомендуем нерегулируемые накладные (ВРН-Н, НР-100 и др.) или регулируемую встраиваемую ВРН-Р."
+                ),
+                action=ChatAction.CONTACT_MANAGER,
+            )
+
+        # Привязка ответов фасадной ветки к фильтрам и подкатегориям (метаданные ChromaDB)
+        if regulated_val == "inertial":
+            # Инерционная: только подкатегория «Инерционные» (category = reshetki-inertsionnye)
+            s["allowed_subcats"] = [
+                slug for slug, r in SUBCATEGORY_RULES.items()
+                if r.get("feature") == "inertial"
+            ]
+            s["active_filters"]["regulated"] = "fixed"
+            # Форму/тип монтажа для инерционных не фильтруем — в БД может не быть этих полей по этой подкатегории
+            s["active_filters"].pop("form", None)
+        elif answers.get("facade_form") == "round":
+            # Круглые решётки для фасада: только наружные (не ВКР «в воздуховод»)
+            s["active_filters"]["product_type"] = "grille"
+            s["active_filters"]["location"] = "outdoor"
+            s["active_filters"]["form"] = "round"
+            s["active_filters"]["regulated"] = "fixed"
+            s["active_filters"].pop("material", None)
+            s["active_filters"].pop("round_diameter_group", None)
+        else:
+            # Обычные фасадные (встраиваемые/накладные): форма из сценария → метаданные
+            form_val = answers.get("facade_form", "")
+            if form_val:
+                s["active_filters"]["form"] = form_val
+            else:
+                s["active_filters"].pop("form", None)
+            # Регулируемая/нерегулируемая — фильтр по метаданным regulated
+            if regulated_val in ("regulated", "fixed"):
+                s["active_filters"]["regulated"] = regulated_val
+            else:
+                s["active_filters"].pop("regulated", None)
+            # allowed_subcats уже задан при входе в фасад (outdoor без инерционных) — не трогаем
+
     recommendation = _recommend_series(session_id)
     query = _build_search_query(session_id)
     if recommendation:
@@ -981,6 +1135,12 @@ async def _detail_search(session_id: str) -> ChatResponse:
 
     scenario = _get_scenario(session_id)
     subcats = s.get("allowed_subcats") or None
+    log.info(
+        "Поиск (detail %s) | filters=%s | subcats=%s",
+        s.get("detail_branch", "?"),
+        s["active_filters"],
+        subcats[:5] if subcats else "all",
+    )
     results = _search_with_fallback(query, s["active_filters"], scenario, subcats)
     context = _build_context(results)
 
@@ -1060,6 +1220,11 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             session["funnel_phase"] = "scenario"
             session["detail_branch"] = None
             session["detail_answers"] = {}
+            # Возврат в сценарий: step_idx мог быть за пределами (например grille indoor → detail при step_idx=2)
+            scenario = _get_scenario(session_id)
+            steps = scenario["steps"]
+            if session["step_idx"] >= len(steps):
+                session["step_idx"] = max(0, len(steps) - 1)
             return _current_step_response(session_id)
 
         if phase == "scenario":
@@ -1179,13 +1344,26 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                         session["step_idx"] = 1
                         return _current_step_response(session_id)
 
-                    # Grille outdoor → FACADE detail branch
+                    # Grille outdoor → FACADE detail branch (только обычные фасадные, без инерционных)
                     if chosen_value == "outdoor" and session.get("scenario_key") == "grille":
                         session["detail_branch"] = "facade"
                         session["detail_step_idx"] = 0
                         session["detail_answers"] = {}
+                        # Инерционные решётки — только при явном выборе; в ветке «Фасад» исключаем
+                        session["allowed_subcats"] = [
+                            s for s in session["allowed_subcats"]
+                            if SUBCATEGORY_RULES.get(s, {}).get("feature") != "inertial"
+                        ]
                         prefix = SALES_ARGS.get("embedded_vs_surface", "")
                         return await _detail_ask(session_id, f"💡 {prefix}\n\n" if prefix else "")
+
+                    # Grille «В воздуховод» — только решётки с формой «Цилиндрические»
+                    if chosen_value == "duct" and session.get("scenario_key") == "grille":
+                        session["active_filters"]["form"] = "cylindrical"
+                        session["grille_phase"] = "done"
+                        session["step_idx"] = 1  # следующий шаг — size_group
+                        session["allowed_subcats"] = list(SUBCATEGORY_RULES.keys())
+                        return _current_step_response(session_id)
 
                     return _grille_advance(session_id)
 
@@ -1314,6 +1492,12 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             session["detail_branch"] = "facade"
             session["detail_step_idx"] = 0
             session["detail_answers"] = {}
+            # В ветке «Фасад» только обычные фасадные, без инерционных
+            subcats = session.get("allowed_subcats") or _filter_subcats_by_location("outdoor")
+            session["allowed_subcats"] = [
+                s for s in subcats
+                if SUBCATEGORY_RULES.get(s, {}).get("feature") != "inertial"
+            ]
             return await _detail_ask(session_id)
         if sk == "grille" and loc == "indoor" and not session.get("detail_branch"):
             session["detail_branch"] = "indoor"
