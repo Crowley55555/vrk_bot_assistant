@@ -490,7 +490,7 @@ async def _ask_llm(user_message: str, session_id: str, context: str) -> str:
 # они только задают allowed_subcats. Сопоставление по сценариям: docs/SCENARIOS_FILTERS.md
 METADATA_FILTER_KEYS = frozenset({
     "product_type", "location", "size_group", "material", "main_category",
-    "regulated", "form", "scenario_block", "round_diameter_group",
+    "regulated", "form", "scenario_block", "round_diameter_group", "installation",
 })
 
 
@@ -589,6 +589,11 @@ def _validate_product(meta: dict, active_filters: dict[str, str]) -> bool:
             continue
         # «В воздуховод»: в метаданных по location не фильтруем
         if key == "location" and value == "duct":
+            continue
+        # installation: только товары с совпадающим способом монтажа (встраиваемая/накладная)
+        if key == "installation":
+            if (product_value or "").strip() != value:
+                return False
             continue
         # scenario_block — производный, не проверяем по полю
         if key == "scenario_block":
@@ -1010,9 +1015,7 @@ async def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
     step = _get_detail_steps(s["detail_branch"])[idx]
     options = step.get("options", [])
     answers = s.get("detail_answers", {})
-    # Для накладной решётки регулируемых в ассортименте нет — не показываем опцию «Да, регулируемая»
-    if step["step_id"] == "facade_regulated" and answers.get("facade_mount_type") == "surface":
-        options = [o for o in options if (o.get("value") or o.get("label")) != "regulated"]
+    # Для накладной решётки шаг регулировки не показывается (applicable_when_not в config)
     buttons = [
         ButtonOption(
             label=opt["label"],
@@ -1085,17 +1088,6 @@ async def _detail_search(session_id: str) -> ChatResponse:
         answers = s.get("detail_answers") or {}
         regulated_val = answers.get("facade_regulated", "")
 
-        # Регулируемых накладных решёток в ассортименте нет — сразу ответ без поиска
-        if answers.get("facade_mount_type") == "surface" and regulated_val == "regulated":
-            _reset_funnel(session_id)
-            return ChatResponse(
-                reply=(
-                    "Регулируемых накладных решёток в ассортименте нет. "
-                    "Рекомендуем нерегулируемые накладные (ВРН-Н, НР-100 и др.) или регулируемую встраиваемую ВРН-Р."
-                ),
-                action=ChatAction.CONTACT_MANAGER,
-            )
-
         # Привязка ответов фасадной ветки к фильтрам и подкатегориям (метаданные ChromaDB)
         if regulated_val == "inertial":
             # Инерционная: только подкатегория «Инерционные» (category = reshetki-inertsionnye)
@@ -1115,14 +1107,21 @@ async def _detail_search(session_id: str) -> ChatResponse:
             s["active_filters"].pop("material", None)
             s["active_filters"].pop("round_diameter_group", None)
         else:
-            # Обычные фасадные (встраиваемые/накладные): форма из сценария → метаданные
+            # Обычные фасадные (встраиваемые/накладные): форма, тип монтажа, регулировка
             form_val = answers.get("facade_form", "")
             if form_val:
                 s["active_filters"]["form"] = form_val
             else:
                 s["active_filters"].pop("form", None)
-            # Регулируемая/нерегулируемая — фильтр по метаданным regulated
-            if regulated_val in ("regulated", "fixed"):
+            # Накладные: только накладные решётки, регулируемых не бывает
+            mount_type = answers.get("facade_mount_type", "")
+            if mount_type in ("embedded", "surface"):
+                s["active_filters"]["installation"] = mount_type
+            else:
+                s["active_filters"].pop("installation", None)
+            if mount_type == "surface":
+                s["active_filters"]["regulated"] = "fixed"
+            elif regulated_val in ("regulated", "fixed"):
                 s["active_filters"]["regulated"] = regulated_val
             else:
                 s["active_filters"].pop("regulated", None)

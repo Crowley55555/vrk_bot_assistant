@@ -346,7 +346,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Да, регулируемая", "value": "regulated"},
             {"label": "Инерционная (с обратным клапаном)", "value": "inertial"},
         ],
-        "applicable_when_not": {"facade_form": "round"},
+        "applicable_when_not": {"facade_form": "round", "facade_mount_type": "surface"},
     },
 ]
 

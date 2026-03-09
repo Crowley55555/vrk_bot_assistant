@@ -279,6 +279,13 @@ def _build_filters(raw_attrs: dict[str, str], name: str, category: str | None) -
     if filters.get("form") == "round":
         filters["round_diameter_group"] = _normalize_round_diameter_group(raw_attrs, name)
 
+    # Способ монтажа (встраиваемая / накладная) — для фильтра «На фасад» по типу решётки
+    mount_raw = (raw_attrs.get("Способ монтажа", "") or "").strip().lower()
+    if "встраива" in mount_raw:
+        filters["installation"] = "embedded"
+    elif "накладн" in mount_raw:
+        filters["installation"] = "surface"
+
     return filters
 
 
