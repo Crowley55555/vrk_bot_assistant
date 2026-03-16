@@ -1144,18 +1144,22 @@ async def _detail_search(session_id: str) -> ChatResponse:
             # allowed_subcats уже задан при входе в фасад (outdoor без инерционных) — не трогаем
 
     elif s.get("detail_branch") == "acoustic":
-        # Акустические решётки: только подкатегория akusticheskie-reshetki и выбранный материал.
-        # location и size_group не фильтруем — в каталоге у акустических часто outdoor/unknown и size_group unknown.
+        # Акустические решётки: только подкатегория akusticheskie-reshetki и только выбранный материал (алюминий/оцинковка)
         answers = s.get("detail_answers") or {}
         s["allowed_subcats"] = ["akusticheskie-reshetki"]
         s["active_filters"]["product_type"] = "grille"
-        s["active_filters"].pop("location", None)
-        s["active_filters"].pop("size_group", None)
+        s["active_filters"]["location"] = "indoor"
         mat = (answers.get("acoustic_material") or "").strip()
         if mat in ("aluminum", "galvanized"):
             s["active_filters"]["material"] = mat
         else:
             s["active_filters"].pop("material", None)
+        sg = (answers.get("size_group") or "").strip()
+        if sg in ("small", "large"):
+            s["active_filters"]["size_group"] = sg
+        else:
+            s["active_filters"].pop("size_group", None)
+        # Нержавеющая сталь в сценарии не предлагается — фильтр только aluminum или galvanized
 
     recommendation = _recommend_series(session_id)
     query = _build_search_query(session_id)
@@ -1368,16 +1372,6 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                     session["allowed_subcats"] = VENT_PARTS_SUBCAT_FILTER.get(chosen_value, all_vp)
 
                 if scenario.get("dynamic") and current_step["step_id"] == "location":
-                    # Сначала отдельные ветки (acoustic, outdoor, duct), чтобы не попасть в len(subcats)==0
-                    if chosen_value == "acoustic" and session.get("scenario_key") == "grille":
-                        session["detail_branch"] = "acoustic"
-                        session["detail_step_idx"] = 0
-                        session["detail_answers"] = {}
-                        session["allowed_subcats"] = ["akusticheskie-reshetki"]
-                        session["active_filters"]["product_type"] = "grille"
-                        session["active_filters"]["location"] = "indoor"
-                        return await _detail_ask(session_id)
-
                     subcats = _filter_subcats_by_location(chosen_value)
                     session["allowed_subcats"] = subcats
 
@@ -1406,6 +1400,16 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                         session["step_idx"] = 1  # следующий шаг — size_group
                         session["allowed_subcats"] = list(SUBCATEGORY_RULES.keys())
                         return _current_step_response(session_id)
+
+                    # Grille «Акустические решетки» — отдельная ветка: фильтр по подкатегории + материал + размер
+                    if chosen_value == "acoustic" and session.get("scenario_key") == "grille":
+                        session["detail_branch"] = "acoustic"
+                        session["detail_step_idx"] = 0
+                        session["detail_answers"] = {}
+                        session["allowed_subcats"] = ["akusticheskie-reshetki"]
+                        session["active_filters"]["product_type"] = "grille"
+                        session["active_filters"]["location"] = "indoor"
+                        return await _detail_ask(session_id)
 
                     return _grille_advance(session_id)
 
@@ -1566,12 +1570,9 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             if idx is not None:
                 branch_steps = _get_detail_steps(session["detail_branch"])
                 step_cfg = branch_steps[idx]
-                opts = step_cfg.get("options", [])
-                if step_cfg.get("step_id") == "acoustic_material":
-                    opts = [o for o in opts if (o.get("value") or "") in ("aluminum", "galvanized")]
                 buttons = [
                     ButtonOption(label=o["label"], value=o.get("value") or o["label"])
-                    for o in opts
+                    for o in step_cfg.get("options", [])
                 ]
                 return ChatResponse(
                     reply=llm_answer + f"\n\n{step_cfg['question']}",
