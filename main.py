@@ -1108,6 +1108,12 @@ async def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
     s["detail_step_idx"] = idx
     s["funnel_phase"] = "detail"
     step = _get_detail_steps(s["detail_branch"])[idx]
+    log.info(
+        "detail flow: asking step | branch=%s | step_id=%s | idx=%d",
+        s.get("detail_branch"),
+        step.get("step_id"),
+        idx,
+    )
     options = step.get("options", [])
     # Аккустические решётки: только Алюминий и Оцинкованная сталь (нержавеющей нет в ассортименте)
     if step.get("step_id") == "acoustic_material":
@@ -1204,7 +1210,16 @@ async def _detail_search(session_id: str) -> ChatResponse:
     ):
         da = s.get("detail_answers") or {}
         if any(k not in da for k in SLOT_GKL_REQUIRED_KEYS):
+            log.info(
+                "detail flow: slot GKL required keys missing → continue asking | have=%s",
+                list(da.keys()),
+            )
             return await _detail_ask(session_id)
+    log.info(
+        "detail flow: branch completed → starting search | branch=%s | answers_keys=%s",
+        s.get("detail_branch"),
+        list((s.get("detail_answers") or {}).keys()),
+    )
     # Подставляем в active_filters ответы из детальной ветки, используемые в метаданных ChromaDB
     if s.get("detail_branch") == "facade":
         answers = s.get("detail_answers") or {}
@@ -1309,6 +1324,78 @@ async def _detail_search(session_id: str) -> ChatResponse:
     )
 
 
+async def _after_main_scenario_completed(session_id: str, user_message: str = "") -> ChatResponse:
+    """
+    Все шаги FUNNEL_SCENARIOS для текущего scenario_key пройдены (кнопки или extracted).
+
+    Дальше: либо detail branch (grille indoor/outdoor, slot_grille), либо прямой поиск.
+    """
+    session = _get_session(session_id)
+    sk = session.get("scenario_key") or ""
+    af = dict(session.get("active_filters") or {})
+    scenario = _get_scenario(session_id)
+    n_steps = len(scenario.get("steps", []))
+
+    log.info(
+        "scenario flow: main scenario steps completed | scenario_key=%s | step_idx=%s/%d | filters=%s",
+        sk,
+        session.get("step_idx"),
+        n_steps,
+        af,
+    )
+
+    if sk == "grille":
+        loc = af.get("location", "")
+        if loc == "indoor":
+            session["detail_branch"] = "indoor"
+            session["detail_step_idx"] = 0
+            session["detail_answers"] = {}
+            session["funnel_phase"] = "detail"
+            log.info("scenario flow: entering detail branch | branch=indoor")
+            return await _detail_ask(session_id)
+        if loc == "duct":
+            log.info("scenario flow: grille duct → starting direct search (no detail)")
+            q = (user_message or "").strip() or _build_search_query(session_id)
+            return await _do_filtered_search(session_id, q)
+        if loc == "outdoor":
+            subcats = session.get("allowed_subcats") or _filter_subcats_by_location("outdoor")
+            session["allowed_subcats"] = [
+                s for s in subcats
+                if SUBCATEGORY_RULES.get(s, {}).get("feature") != "inertial"
+            ]
+            session["detail_branch"] = "facade"
+            session["detail_step_idx"] = 0
+            session["detail_answers"] = {}
+            session["funnel_phase"] = "detail"
+            log.info("scenario flow: entering detail branch | branch=facade (outdoor path)")
+            prefix = SALES_ARGS.get("embedded_vs_surface", "")
+            return await _detail_ask(session_id, f"💡 {prefix}\n\n" if prefix else "")
+
+    if sk == "slot_grille":
+        session["detail_branch"] = "slot"
+        session["detail_step_idx"] = 0
+        prefill: dict[str, str] = {}
+        sm = af.get("slot_mount", "")
+        if sm:
+            # В FUNNEL — filter_value «visible», в SLOT_STEPS — value «visible_frame»
+            prefill["slot_mount"] = "visible_frame" if sm == "visible" else sm
+        sct = af.get("slot_ceiling_type", "")
+        if sct:
+            prefill["slot_ceiling_type"] = sct
+        session["detail_answers"] = prefill
+        session["funnel_phase"] = "detail"
+        log.info(
+            "scenario flow: entering detail branch | branch=slot | prefill=%s",
+            prefill,
+        )
+        return await _detail_ask(session_id)
+
+    log.info(
+        "scenario flow: starting direct search | scenario_key=%s (no detail branch for this scenario)",
+        sk,
+    )
+    q = (user_message or "").strip() or _build_search_query(session_id)
+    return await _do_filtered_search(session_id, q)
 
 
 def _is_explicit_product_info_query(message: str) -> bool:
@@ -1462,8 +1549,15 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             idx = session["detail_step_idx"]
             if idx > 0:
                 steps = _get_detail_steps(session["detail_branch"])
-                session["detail_answers"].pop(steps[idx - 1]["step_id"], None)
+                prev_id = steps[idx - 1]["step_id"]
+                session["detail_answers"].pop(prev_id, None)
                 session["detail_step_idx"] = idx - 1
+                log.info(
+                    "detail flow: back → branch=%s | removed_step=%s | new_idx=%d",
+                    session["detail_branch"],
+                    prev_id,
+                    session["detail_step_idx"],
+                )
                 return await _detail_ask(session_id)
             session["funnel_phase"] = "scenario"
             session["detail_branch"] = None
@@ -1631,37 +1725,13 @@ async def process_message(request: ChatRequest) -> ChatResponse:
 
                 session["step_idx"] = idx + 1
                 if session["step_idx"] < len(steps):
-                    # After last scenario step for grille indoor → detail branch
-                    if (
-                        session.get("scenario_key") == "grille"
-                        and session["step_idx"] >= len(steps)
-                    ):
-                        session["detail_branch"] = "indoor"
-                        session["detail_step_idx"] = 0
-                        session["detail_answers"] = {}
-                        return await _detail_ask(session_id)
                     return _current_step_response(session_id)
 
-                # All scenario steps done
-                sk = session.get("scenario_key", "")
-                if sk == "grille" and session["active_filters"].get("location") == "indoor":
-                    session["detail_branch"] = "indoor"
-                    session["detail_step_idx"] = 0
-                    session["detail_answers"] = {}
-                    return await _detail_ask(session_id)
-
-                if sk == "slot_grille":
-                    af = session["active_filters"]
-                    if af.get("slot_mount") == "concealed" and af.get("slot_ceiling_type") == "gkl":
-                        session["detail_branch"] = "slot"
-                        session["detail_step_idx"] = 0
-                        session["detail_answers"] = {
-                            "slot_mount": "concealed",
-                            "slot_ceiling_type": "gkl",
-                        }
-                        return await _detail_ask(session_id)
-
-                return await _do_filtered_search(session_id, _build_search_query(session_id))
+                log.info(
+                    "scenario flow: last FUNNEL step answered via buttons | session=%s",
+                    session_id[:16],
+                )
+                return await _after_main_scenario_completed(session_id, message)
 
     # ── Распознавание намерений ──
     intents = analyze_intent(message)
@@ -1762,27 +1832,16 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                 buttons=_make_buttons(step_cfg),
             )
 
-        # Grille text → activate detail branch
-        loc = session["active_filters"].get("location", "")
-        sk = session.get("scenario_key", "")
-        if sk == "grille" and loc == "outdoor" and not session.get("detail_branch"):
-            session["detail_branch"] = "facade"
-            session["detail_step_idx"] = 0
-            session["detail_answers"] = {}
-            # В ветке «Фасад» только обычные фасадные, без инерционных
-            subcats = session.get("allowed_subcats") or _filter_subcats_by_location("outdoor")
-            session["allowed_subcats"] = [
-                s for s in subcats
-                if SUBCATEGORY_RULES.get(s, {}).get("feature") != "inertial"
-            ]
-            return await _detail_ask(session_id)
-        if sk == "grille" and loc == "indoor" and not session.get("detail_branch"):
-            session["detail_branch"] = "indoor"
-            session["detail_step_idx"] = 0
-            session["detail_answers"] = {}
-            return await _detail_ask(session_id)
-
-        return await _do_filtered_search(session_id, message)
+        # Все шаги сценария заполнены из текста — синхронизируем step_idx и уходим в тот же
+        # маршрут, что и после последней кнопки (detail → search), иначе slot_grille и др.
+        # преждевременно попадали в _do_filtered_search без detail-ветки.
+        session["step_idx"] = len(steps)
+        session["funnel_phase"] = "scenario"
+        log.info(
+            "scenario flow: extracted text filled all FUNNEL steps | scenario_key=%s | starting completion",
+            session.get("scenario_key"),
+        )
+        return await _after_main_scenario_completed(session_id, message)
 
     # ── Триггеры начала воронки ──
     if _is_start_funnel(message) and session["funnel_phase"] is None:
