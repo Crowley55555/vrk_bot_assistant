@@ -55,7 +55,11 @@ from models import ButtonOption, ChatAction, ChatRequest, ChatResponse
 from product_entity_helpers import (
     extract_product_entities,
     filter_results_by_entities,
+    filter_results_by_product_type,
+    is_analog_or_similar_intent,
+    is_generic_catalog_query,
     is_specific_product_query,
+    rank_exact_or_near_exact_matches,
 )
 from scheduler import start_scheduler
 from vector_store import get_collection, search, warmup_embedding_and_search
@@ -825,12 +829,73 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
     session = _get_session(session_id)
     scenario = _get_scenario(session_id)
     query = user_message or _build_search_query(session_id)
+    text_probe = (user_message or "").strip() or query
     subcats = session.get("allowed_subcats") or None
     if session.get("scenario_key") == "slot_grille" and subcats:
         subcats = _filter_slot_grille_subcats(subcats, session["active_filters"])
     # Детали систем вентиляции (адаптеры и др.): больше результатов — в подкатегориях много позиций
     n_results = 15 if session.get("scenario_key") == "vent_parts" else 8
     results = _search_with_fallback(query, session["active_filters"], scenario, subcats, n_results=n_results)
+
+    entities = extract_product_entities(text_probe)
+    sk = session.get("scenario_key")
+    analog = is_analog_or_similar_intent(text_probe)
+    generic_cat = is_generic_catalog_query(text_probe, entities)
+    specific = (
+        is_specific_product_query(text_probe, entities)
+        and not analog
+        and not generic_cat
+    )
+
+    if specific and entities and not analog:
+        log.info(
+            "filtered search: specific product query | entities=%s | scenario=%s",
+            entities,
+            sk,
+        )
+        matched = filter_results_by_entities(results, entities)
+        matched = filter_results_by_product_type(matched, sk)
+        if not matched:
+            matched = filter_results_by_entities(
+                _search_with_fallback(
+                    text_probe,
+                    session["active_filters"],
+                    scenario,
+                    subcats,
+                    n_results=40,
+                ),
+                entities,
+            )
+            matched = filter_results_by_product_type(matched, sk)
+        if matched:
+            results = rank_exact_or_near_exact_matches(matched, entities)
+            log.info(
+                "filtered search: entity match | n=%d | suppressing unrelated cards",
+                len(results),
+            )
+        else:
+            log.info(
+                "filtered search: no entity match | suppressing unrelated product cards | scenario=%s",
+                sk,
+            )
+            ctx = _build_context([])
+            reply = await _ask_llm(
+                (
+                    f"Запрос (поиск после воронки): {query}\n"
+                    "Точного совпадения по названию/серии из запроса в выдаче нет. "
+                    "Ответь кратко; не выдумывай товар."
+                ),
+                session_id,
+                ctx,
+            )
+            _reset_funnel(session_id)
+            return ChatResponse(reply=reply.strip(), action=ChatAction.ASK_QUESTION)
+    elif generic_cat:
+        log.info(
+            "filtered search: generic category query — multi-product OK | scenario=%s",
+            sk,
+        )
+
     log.info(
         "Поиск | scenario=%s | filters=%s | subcats=%s | results=%d",
         session.get("scenario_key", "?"),
@@ -844,8 +909,9 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
         f"Клиент ищет: {query}. Подбери подходящие товары из контекста.",
         session_id, context,
     )
-    # Детали систем вентиляции: показываем до 10 карточек (адаптеры, КСД и др.)
     n_products = 10 if session.get("scenario_key") == "vent_parts" else 5
+    if specific and entities:
+        n_products = min(3, max(1, len(results)))
     products = _product_data_list(results, n=n_products)
     _reset_funnel(session_id)
     if products:
@@ -1457,15 +1523,17 @@ async def _handle_product_info(session_id: str, message: str) -> ChatResponse:
     s = _get_session(session_id)
     subject = _extract_product_subject(message) or message
     entities = extract_product_entities(message)
-    specific = is_specific_product_query(message, entities)
+    analog = is_analog_or_similar_intent(message)
+    specific = is_specific_product_query(message, entities) and not analog
 
     scenario = _get_scenario(session_id)
     af = dict(s.get("active_filters") or {})
     subcats = s.get("allowed_subcats") or None
 
     log.info(
-        "product info: detected | specific=%s | entities=%s | subject=%s",
+        "product info: detected | specific=%s | analog=%s | entities=%s | subject=%s",
         specific,
+        analog,
         entities,
         subject[:100],
     )
@@ -1475,13 +1543,15 @@ async def _handle_product_info(session_id: str, message: str) -> ChatResponse:
 
     if specific and entities:
         matched = filter_results_by_entities(results, entities)
+        matched = filter_results_by_product_type(matched, s.get("scenario_key"))
         if not matched:
             matched = filter_results_by_entities(
                 search(subject, n_results=50),
                 entities,
             )
+            matched = filter_results_by_product_type(matched, s.get("scenario_key"))
         if matched:
-            results = matched[:12]
+            results = rank_exact_or_near_exact_matches(matched, entities)[:12]
             log.info(
                 "product info: exact/near-entity match | n=%d | suppressing unrelated cards",
                 len(matched),
@@ -1559,9 +1629,48 @@ async def _maybe_product_info_branch(session_id: str, message: str) -> ChatRespo
     return await _handle_product_info(session_id, message)
 
 
-def _handle_special_intent(session_id: str, message: str, intents: dict) -> ChatResponse | None:
+async def _handle_special_intent(session_id: str, message: str, intents: dict) -> ChatResponse | None:
     """Обрабатывает специальные намерения: аналог, нестандарт."""
     if intents.get("analog"):
+        entities = extract_product_entities(message)
+        wants_catalog_analog = is_analog_or_similar_intent(message) and (
+            bool(entities) or len(message.strip()) >= 18
+        )
+        if wants_catalog_analog:
+            log.info(
+                "special intent: analog query -> related products | extracted entity=%s",
+                entities,
+            )
+            s = _get_session(session_id)
+            scenario = _get_scenario(session_id)
+            af = dict(s.get("active_filters") or {})
+            subcats = s.get("allowed_subcats") or None
+            q = message.strip()
+            results = _search_with_fallback(q, af, scenario, subcats, n_results=25)
+            results = filter_results_by_product_type(results, s.get("scenario_key"))
+            if not results:
+                raw = search(q, n_results=40)
+                results = filter_results_by_product_type(raw, s.get("scenario_key"))
+            if results:
+                ctx = _build_context(results)
+                reply = await _ask_llm(
+                    (
+                        f"Клиент ищет аналог или похожую позицию: {message}\n"
+                        "Ответь кратко по фактам из контекста; предложи варианты из списка."
+                    ),
+                    session_id,
+                    ctx,
+                )
+                products = _product_data_list(results, n=min(5, len(results)))
+                if products:
+                    return ChatResponse(
+                        reply=reply.strip(),
+                        action=ChatAction.SHOW_PRODUCT,
+                        products=products,
+                    )
+            log.info(
+                "special intent: analog — no catalog hits, fallback to manager instructions",
+            )
         return ChatResponse(
             reply=(
                 f"🔍 **Подбор аналога**\n\n{SALES_ARGS['analog_instruction']}\n\n"
@@ -1796,7 +1905,7 @@ async def process_message(request: ChatRequest) -> ChatResponse:
     session["detected_intents"].update(intents)
 
     # Специальные намерения: аналог, нестандарт
-    special = _handle_special_intent(session_id, message, intents)
+    special = await _handle_special_intent(session_id, message, intents)
     if special:
         return special
 
@@ -1908,31 +2017,38 @@ async def process_message(request: ChatRequest) -> ChatResponse:
     # ── Свободный вопрос (RAG) ──
     results = search(message, n_results=25)
     entities = extract_product_entities(message)
+    sk_free = session.get("scenario_key")
+    if is_analog_or_similar_intent(message):
+        log.info("free RAG: analog query -> show related products (semantic)")
+    elif is_generic_catalog_query(message, entities):
+        log.info("free RAG: generic category query -> show product list")
     specific = is_specific_product_query(message, entities)
     matched_er: list[dict] = []
 
     if specific and entities:
         log.info(
-            "free RAG: specific product query | entities=%s | semantic_hits=%d",
+            "free RAG: detected specific product query | entities=%s | semantic_hits=%d",
             entities,
             len(results),
         )
         matched_er = filter_results_by_entities(results, entities)
+        matched_er = filter_results_by_product_type(matched_er, sk_free)
         if not matched_er:
             matched_er = filter_results_by_entities(
                 search(_extract_product_subject(message) or message, n_results=50),
                 entities,
             )
+            matched_er = filter_results_by_product_type(matched_er, sk_free)
         if matched_er:
-            results = matched_er
+            results = rank_exact_or_near_exact_matches(matched_er, entities)
             context = _build_context(results)
             log.info(
-                "free RAG: entity-filtered results | n=%d",
+                "free RAG: exact/near-exact match | n=%d | entity-filtered",
                 len(results),
             )
         else:
             log.info(
-                "free RAG: no entity match in metadata | suppressing unrelated product cards",
+                "free RAG: suppressing unrelated product cards (no entity match in metadata)",
             )
             context = _build_context([])
             llm_answer = await _ask_llm(
@@ -1949,6 +2065,10 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                 action=ChatAction.ASK_QUESTION,
             )
     else:
+        if sk_free:
+            filtered = filter_results_by_product_type(results, sk_free)
+            if filtered:
+                results = filtered
         context = _build_context(results)
 
     llm_answer = await _ask_llm(message, session_id, context)
