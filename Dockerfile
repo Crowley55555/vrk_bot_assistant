@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-RUN mkdir -p data logs chroma_db
+RUN mkdir -p data logs chroma_db .cache
 
 EXPOSE 8000
 

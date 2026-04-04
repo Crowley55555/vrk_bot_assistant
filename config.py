@@ -23,6 +23,13 @@ STATIC_DIR = BASE_DIR / "static"
 DATA_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
+# Кэш ONNX / HuggingFace для эмбеддингов Chroma — задать до импорта chromadb в других модулях.
+_MODEL_CACHE_ROOT = Path(os.getenv("MODEL_CACHE_ROOT", str(BASE_DIR / ".cache")))
+_MODEL_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("HF_HOME", str(_MODEL_CACHE_ROOT / "huggingface"))
+os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", str(_MODEL_CACHE_ROOT / "sentence_transformers"))
+os.environ.setdefault("XDG_CACHE_HOME", str(_MODEL_CACHE_ROOT))
+
 RAW_PRODUCTS_PATH = DATA_DIR / "raw_products.json"
 
 # ─── Логирование ───────────────────────────────────────────────────────────────

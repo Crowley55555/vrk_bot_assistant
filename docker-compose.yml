@@ -14,6 +14,7 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./chroma_db:/app/chroma_db
+      - ./model_cache:/app/.cache
     command: python -m uvicorn main:app --host 0.0.0.0 --port 8000
 
   # ─── Telegram-бот (отдельный процесс) ─────────────────────────────────
@@ -27,6 +28,7 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./chroma_db:/app/chroma_db
+      - ./model_cache:/app/.cache
     command: python telegram_bot.py
     depends_on:
       - backend

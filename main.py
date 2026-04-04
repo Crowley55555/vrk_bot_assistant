@@ -10,6 +10,7 @@ FastAPI-бэкенд бота-консультанта ООО "Завод ВРК
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections import defaultdict
@@ -52,7 +53,7 @@ from llm_factory import get_llm
 from logger import get_logger
 from models import ButtonOption, ChatAction, ChatRequest, ChatResponse
 from scheduler import start_scheduler
-from vector_store import get_collection, search
+from vector_store import get_collection, search, warmup_embedding_and_search
 
 log = get_logger(__name__)
 
@@ -440,6 +441,7 @@ async def lifespan(app: FastAPI):
 
     get_collection()
     await ensure_catalog_ready()
+    await asyncio.to_thread(warmup_embedding_and_search)
 
     sched = start_scheduler()
     yield

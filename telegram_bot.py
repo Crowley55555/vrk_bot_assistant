@@ -28,6 +28,7 @@ async def _ensure_response(raw):
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -44,8 +45,37 @@ from config import (
 from logger import get_logger
 from main import process_message
 from models import ButtonOption, ChatAction, ChatRequest, ChatResponse
+from vector_store import warmup_embedding_and_search
 
 log = get_logger(__name__)
+
+
+async def safe_answer_callback(
+    callback: CallbackQuery,
+    text: str | None = None,
+    *,
+    show_alert: bool = False,
+) -> None:
+    """
+    Сразу подтверждает callback у Telegram (лимит ~10 с), не роняет хендлер при
+    повторном answer, устаревшем query или сетевой ошибке.
+    """
+    try:
+        await callback.answer(text=text, show_alert=show_alert)
+        log.info(
+            "callback acknowledged | data=%s",
+            (callback.data or "")[:64],
+        )
+    except TelegramBadRequest as exc:
+        err = str(exc).lower()
+        if "query is too old" in err or "already answered" in err or "not valid" in err:
+            log.warning("callback answer skipped (stale or duplicate): %s", exc)
+        else:
+            log.warning("callback answer TelegramBadRequest (non-fatal): %s", exc)
+    except TelegramNetworkError as exc:
+        log.warning("callback answer network error (non-fatal): %s", exc)
+    except Exception as exc:
+        log.warning("callback answer failed (non-fatal): %s", exc)
 
 router = Router()
 
@@ -210,7 +240,7 @@ async def cmd_start(message: Message) -> None:
 @router.callback_query(F.data == "__back__")
 async def cb_back(callback: CallbackQuery) -> None:
     """«◀️ Назад» — возврат на предыдущий шаг воронки."""
-    await callback.answer()
+    await safe_answer_callback(callback)
     user_id = callback.from_user.id
     session = _session_id(user_id)
 
@@ -222,7 +252,7 @@ async def cb_back(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "__main_menu__")
 async def cb_main_menu(callback: CallbackQuery) -> None:
     """«🏠 Главное меню» — сброс и возврат к первому шагу воронки."""
-    await callback.answer()
+    await safe_answer_callback(callback)
     user_id = callback.from_user.id
     _reset_session(user_id)
     session = _session_id(user_id)
@@ -235,7 +265,7 @@ async def cb_main_menu(callback: CallbackQuery) -> None:
 @router.callback_query()
 async def cb_funnel_step(callback: CallbackQuery) -> None:
     """Обработчик Inline-кнопок воронки (варианты ответа)."""
-    await callback.answer()
+    await safe_answer_callback(callback)
     user_id = callback.from_user.id
     session = _session_id(user_id)
     chosen = callback.data or ""
@@ -264,6 +294,9 @@ async def run_bot() -> None:
     if not TELEGRAM_BOT_TOKEN:
         log.critical("TELEGRAM_BOT_TOKEN не задан в .env!")
         return
+
+    log.info("Telegram-бот: прогрев embedding / Chroma (отдельный процесс от backend) …")
+    await asyncio.to_thread(warmup_embedding_and_search)
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     dp = Dispatcher()
