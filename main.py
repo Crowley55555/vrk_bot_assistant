@@ -515,8 +515,36 @@ def _format_active_filters(session_id: str) -> str:
     return ", ".join(parts)
 
 
+def _message_content_to_str(content: Any) -> str:
+    """LangChain может вернуть content как str или список блоков (мультимодальные модели)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                txt = block.get("text")
+                if isinstance(txt, str):
+                    parts.append(txt)
+            else:
+                parts.append(str(block))
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+
 async def _ask_llm(user_message: str, session_id: str, context: str) -> str:
-    llm = get_llm()
+    try:
+        llm = get_llm()
+    except RuntimeError as exc:
+        log.error("LLM недоступен: %s", exc)
+        return (
+            "Не удалось обратиться к языковой модели — проверьте ключи в .env. "
+            f"Телефон менеджера: {MANAGER_CONTACTS['phone']}"
+        )
     session = _get_session(session_id)
     filters_text = _format_active_filters(session_id)
     system_msg = SystemMessage(
@@ -526,10 +554,16 @@ async def _ask_llm(user_message: str, session_id: str, context: str) -> str:
     messages = [system_msg] + history + [HumanMessage(content=user_message)]
     try:
         response: AIMessage = await llm.ainvoke(messages)
-        answer = response.content
+        answer = _message_content_to_str(response.content)
     except Exception as exc:
         log.error("Ошибка LLM: %s", exc)
         answer = "Извините, произошла техническая ошибка. Попробуйте ещё раз или свяжитесь с менеджером."
+    if not answer:
+        log.warning("LLM вернул пустой ответ")
+        answer = (
+            "Не удалось сформулировать ответ. Уточните вопрос или "
+            f"свяжитесь с менеджером: {MANAGER_CONTACTS['phone']}"
+        )
     session["history"].append(HumanMessage(content=user_message))
     session["history"].append(AIMessage(content=answer))
     return answer
@@ -1790,13 +1824,16 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             buttons=_make_buttons(step_cfg),
         )
 
-    if results and results[0]["distance"] < 0.7:
+    # Показываем карточки по любым семантическим попаданиям (порог distance слишком
+    # жёстко отсекал релевантные товары при разных метриках Chroma/эмбеддинга).
+    if results:
         products = _product_data_list(results, n=5)
-        return ChatResponse(
-            reply="Вот решетки которые вам могут подойти:",
-            action=ChatAction.SHOW_PRODUCT,
-            products=products,
-        )
+        if products:
+            return ChatResponse(
+                reply="Вот решетки которые вам могут подойти:",
+                action=ChatAction.SHOW_PRODUCT,
+                products=products,
+            )
     return ChatResponse(reply=llm_answer, action=ChatAction.ASK_QUESTION)
 
 

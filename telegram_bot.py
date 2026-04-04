@@ -15,6 +15,7 @@ Telegram-бот ООО "Завод ВРК" на aiogram 3.x.
 from __future__ import annotations
 
 import asyncio
+import html
 import re
 import uuid
 
@@ -119,6 +120,18 @@ def _strip_bare_urls(text: str) -> str:
     return _URL_RE.sub("", text).strip()
 
 
+def _tg_html_escape(text: str) -> str:
+    """
+    Экранирует &, <, > для ParseMode.HTML.
+
+    Сырой ответ LLM часто содержит «<» (сравнения, обрывки тегов) — Telegram
+    отклоняет сообщение, пользователь не видит ответа.
+    """
+    if not text:
+        return ""
+    return html.escape(text, quote=False)
+
+
 async def _send_response(
     target: Message | CallbackQuery,
     response: ChatResponse,
@@ -138,7 +151,7 @@ async def _send_response(
     # Выдача списка товаров: каждое сообщение отдельно
     if response.products and len(response.products) > 0:
         await send(
-            _strip_bare_urls(response.reply),
+            _tg_html_escape(_strip_bare_urls(response.reply)),
             parse_mode=ParseMode.HTML,
         )
         for product in response.products:
@@ -158,11 +171,11 @@ async def _send_response(
         return
 
     # Обычное сообщение (один товар или без товара)
-    text = _strip_bare_urls(response.reply)
+    text = _tg_html_escape(_strip_bare_urls(response.reply))
     product_url = None
     if response.action == ChatAction.SHOW_PRODUCT and response.product_data:
         card = _format_product_card(response.product_data)
-        text = f"{_strip_bare_urls(text)}\n\n{card}"
+        text = f"{text}\n\n{card}"
         product_url = response.product_data.get("url")
 
     show_nav = not _is_main_menu(response)
