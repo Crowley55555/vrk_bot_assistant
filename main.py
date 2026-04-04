@@ -52,6 +52,11 @@ from catalog_bootstrap import ensure_catalog_ready
 from llm_factory import get_llm
 from logger import get_logger
 from models import ButtonOption, ChatAction, ChatRequest, ChatResponse
+from product_entity_helpers import (
+    extract_product_entities,
+    filter_results_by_entities,
+    is_specific_product_query,
+)
 from scheduler import start_scheduler
 from vector_store import get_collection, search, warmup_embedding_and_search
 
@@ -1451,10 +1456,56 @@ def _strict_slot_gkl_incomplete(session_id: str) -> bool:
 async def _handle_product_info(session_id: str, message: str) -> ChatResponse:
     s = _get_session(session_id)
     subject = _extract_product_subject(message) or message
+    entities = extract_product_entities(message)
+    specific = is_specific_product_query(message, entities)
+
     scenario = _get_scenario(session_id)
     af = dict(s.get("active_filters") or {})
     subcats = s.get("allowed_subcats") or None
-    results = _search_with_fallback(subject, af, scenario, subcats, n_results=8)
+
+    log.info(
+        "product info: detected | specific=%s | entities=%s | subject=%s",
+        specific,
+        entities,
+        subject[:100],
+    )
+
+    results = _search_with_fallback(subject, af, scenario, subcats, n_results=20)
+    matched: list[dict] = []
+
+    if specific and entities:
+        matched = filter_results_by_entities(results, entities)
+        if not matched:
+            matched = filter_results_by_entities(
+                search(subject, n_results=50),
+                entities,
+            )
+        if matched:
+            results = matched[:12]
+            log.info(
+                "product info: exact/near-entity match | n=%d | suppressing unrelated cards",
+                len(matched),
+            )
+        else:
+            log.info(
+                "product info: exact product match not found | suppressing unrelated product cards",
+            )
+            ctx = _build_context([])
+            reply = await _ask_llm(
+                (
+                    f"Запрос: {message}\n"
+                    "В предоставленном контексте нет карточки с точным совпадением "
+                    "названия/серии из запроса. Ответь кратко: такой позиции в выгрузке не видно; "
+                    "не придумывай характеристики. Предложи уточнить артикул или написать менеджеру."
+                ),
+                session_id,
+                ctx,
+            )
+            return ChatResponse(
+                reply=reply.strip(),
+                action=ChatAction.ASK_QUESTION,
+            )
+
     if not results:
         return ChatResponse(
             reply=(
@@ -1482,7 +1533,12 @@ async def _handle_product_info(session_id: str, message: str) -> ChatResponse:
         session_id,
         ctx,
     )
-    products = _product_data_list(results, n=5)
+    if specific and entities:
+        n_cards = min(3, len(results))
+    else:
+        n_cards = 5
+    n_cards = min(n_cards, max(1, len(results)))
+    products = _product_data_list(results, n=n_cards)
     if not products:
         return ChatResponse(
             reply=(
@@ -1850,8 +1906,51 @@ async def process_message(request: ChatRequest) -> ChatResponse:
         return _goto_main_menu(session_id)
 
     # ── Свободный вопрос (RAG) ──
-    results = search(message, n_results=5)
-    context = _build_context(results)
+    results = search(message, n_results=25)
+    entities = extract_product_entities(message)
+    specific = is_specific_product_query(message, entities)
+    matched_er: list[dict] = []
+
+    if specific and entities:
+        log.info(
+            "free RAG: specific product query | entities=%s | semantic_hits=%d",
+            entities,
+            len(results),
+        )
+        matched_er = filter_results_by_entities(results, entities)
+        if not matched_er:
+            matched_er = filter_results_by_entities(
+                search(_extract_product_subject(message) or message, n_results=50),
+                entities,
+            )
+        if matched_er:
+            results = matched_er
+            context = _build_context(results)
+            log.info(
+                "free RAG: entity-filtered results | n=%d",
+                len(results),
+            )
+        else:
+            log.info(
+                "free RAG: no entity match in metadata | suppressing unrelated product cards",
+            )
+            context = _build_context([])
+            llm_answer = await _ask_llm(
+                (
+                    f"{message}\n\n"
+                    "Контекст каталога пуст для точного совпадения по названию/серии. "
+                    "Ответь кратко: совпадения нет; не выдумывай товар."
+                ),
+                session_id,
+                context,
+            )
+            return ChatResponse(
+                reply=llm_answer.strip(),
+                action=ChatAction.ASK_QUESTION,
+            )
+    else:
+        context = _build_context(results)
+
     llm_answer = await _ask_llm(message, session_id, context)
 
     if session["funnel_phase"] in ("product_type", "scenario", "detail"):
@@ -1885,13 +1984,18 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             buttons=_make_buttons(step_cfg),
         )
 
-    # Показываем карточки по любым семантическим попаданиям (порог distance слишком
-    # жёстко отсекал релевантные товары при разных метриках Chroma/эмбеддинга).
+    # Общая выдача: пачка карточек по семантике. Для запроса о конкретной модели —
+    # только отфильтрованные по сущности (см. выше).
     if results:
-        products = _product_data_list(results, n=5)
+        n_show = min(3 if (specific and entities) else 5, len(results))
+        products = _product_data_list(results, n=n_show)
         if products:
             return ChatResponse(
-                reply="Вот решетки которые вам могут подойти:",
+                reply=(
+                    "Вот подходящие позиции по запросу:"
+                    if (specific and entities)
+                    else "Вот решетки которые вам могут подойти:"
+                ),
                 action=ChatAction.SHOW_PRODUCT,
                 products=products,
             )
