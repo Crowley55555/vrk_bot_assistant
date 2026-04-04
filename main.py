@@ -47,11 +47,12 @@ from config import (
     SUBCATEGORY_RULES,
     SYSTEM_PROMPT,
 )
+from catalog_bootstrap import ensure_catalog_ready
 from llm_factory import get_llm
 from logger import get_logger
 from models import ButtonOption, ChatAction, ChatRequest, ChatResponse
 from scheduler import start_scheduler
-from vector_store import get_collection, reindex_all, search
+from vector_store import get_collection, search
 
 log = get_logger(__name__)
 
@@ -437,10 +438,8 @@ async def lifespan(app: FastAPI):
     except RuntimeError as exc:
         log.critical(str(exc))
 
-    col = get_collection()
-    if col.count() == 0:
-        log.info("ChromaDB пуста — попытка индексации из raw_products.json …")
-        reindex_all()
+    get_collection()
+    await ensure_catalog_ready()
 
     sched = start_scheduler()
     yield

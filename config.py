@@ -33,6 +33,19 @@ LOG_FILE = LOGS_DIR / "bot.log"
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", str(BASE_DIR / "chroma_db"))
 CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "vrk_products")
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Старт бэкенда: первичный парсинг и индексация (см. catalog_bootstrap.ensure_catalog_ready)
+BOOTSTRAP_SCRAPER_ON_START = _env_bool("BOOTSTRAP_SCRAPER_ON_START", True)
+FORCE_SCRAPER_ON_START = _env_bool("FORCE_SCRAPER_ON_START", False)
+REINDEX_ON_START = _env_bool("REINDEX_ON_START", True)
+
 # ─── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
