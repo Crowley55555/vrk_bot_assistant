@@ -341,11 +341,11 @@ FACADE_STEPS: list[dict] = [
     },
     {
         "step_id": "facade_construction",
-        "question": "Какой тип конструкции нужен?",
+        "question": "Что для вас важнее по прочности рамы и ламелей?",
         "options": [
-            {"label": "Стандартная конструкция", "value": "standard"},
-            {"label": "Усиленная конструкция рамы", "value": "reinforced_frame"},
-            {"label": "Усиленная рама + ламели", "value": "reinforced_full"},
+            {"label": "Обычная (типовая) комплектация", "value": "standard"},
+            {"label": "Более жёсткая рама", "value": "reinforced_frame"},
+            {"label": "Максимальная жёсткость рамы и ламелей", "value": "reinforced_full"},
         ],
         "applicable_when_not": {"facade_form": "round"},
     },
@@ -411,7 +411,7 @@ INDOOR_STEPS: list[dict] = [
             {"label": "Цена (бюджетный вариант)", "value": "budget"},
             {"label": "Дизайн (декоративная)", "value": "design"},
             {"label": "Премиум качество", "value": "premium"},
-            {"label": "Максимальный воздухопоток (высокий КЖС)", "value": "high_kzhs"},
+            {"label": "Максимальный поток воздуха", "value": "high_kzhs"},
         ],
     },
     {
@@ -462,17 +462,90 @@ SLOT_STEPS: list[dict] = [
         ],
     },
     {
+        "step_id": "gkl_drywall_mm",
+        "question": "Какая толщина гипсокартона: 9 или 12 мм?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "9 мм", "value": "9mm"},
+            {"label": "12 мм", "value": "12mm"},
+        ],
+    },
+    {
+        "step_id": "gkl_layers",
+        "question": "Сколько слоёв гипсокартона: один или два?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "Один слой", "value": "1"},
+            {"label": "Два слоя", "value": "2"},
+        ],
+    },
+    {
+        "step_id": "gkl_air_volume",
+        "question": "Какой нужен воздухообмен по ощущениям?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "Небольшой (типичная комната)", "value": "low"},
+            {"label": "Средний", "value": "medium"},
+            {"label": "Сильный / нужна консультация по расчёту", "value": "high"},
+        ],
+    },
+    {
+        "step_id": "gkl_supply_exhaust",
+        "question": "Это подача воздуха или вытяжка?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "Подача", "value": "supply"},
+            {"label": "Вытяжка", "value": "exhaust"},
+        ],
+    },
+    {
+        "step_id": "gkl_slot_layout",
+        "question": "Сколько линий щели нужно: одна, несколько или разветвление (Y)?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "Одна линия", "value": "single"},
+            {"label": "Несколько линий", "value": "multi"},
+            {"label": "Y-образно", "value": "y_shape"},
+        ],
+    },
+    {
+        "step_id": "gkl_regulation",
+        "question": "Как нужно регулировать поток: дефлектор, лопатки, клапан, только выравнивание или переходы под PL?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "Дефлектор", "value": "deflector"},
+            {"label": "Лопатки", "value": "blades"},
+            {"label": "Клапан", "value": "valve"},
+            {"label": "Только выравнивание потока", "value": "equalizer"},
+            {"label": "Переходы под PL", "value": "pl_bushings"},
+        ],
+    },
+    {
         "step_id": "slot_slots_count",
         "question": "Сколько щелей?",
         "options": [
             {"label": "Одна щель", "value": "single"},
             {"label": "Несколько щелей", "value": "multi"},
         ],
+        "applicable_when_not": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
     },
 ]
 
+# Обязательные ответы для скрытой щелевой в ГКЛ перед финальным подбором (детальная ветка slot).
+SLOT_GKL_REQUIRED_KEYS: frozenset[str] = frozenset({
+    "slot_adapter",
+    "gkl_drywall_mm",
+    "gkl_layers",
+    "gkl_air_volume",
+    "gkl_supply_exhaust",
+    "gkl_slot_layout",
+    "gkl_regulation",
+})
+
+
 SLOT_SERIES: dict[str, list[str]] = {
-    "gkl":           ["PV", "TL", "VL-G", "HL", "PL35M", "PL50M"],
+
+    "gkl":           ["PV", "TL", "VL-G", "HL", "PL35M", "PL50M", "VLL-G", "VLLS-G"],
     "plaster":       ["VL-S", "G-LOOK", "G-Line-1", "Airline-1", "Airslot", "SDL"],
     "stretch":       ["VL-F", "VLL-F", "VLLS-F"],
     "visible_frame": ["VLL-S", "G-Line-T", "Airline-T", "G-Line-TS", "Airline-TS", "VLLS-S"],
@@ -539,6 +612,10 @@ INTENT_TRIGGERS: dict[str, list[str]] = {
     "premium": [
         "премиум", "премиальн", "дорог", "лучш", "качеств",
         "шлифован", "дизайн",
+    ],
+    "product_info": [
+        "расскажи про", "расскажите про", "что такое", "что за ", "чем отличается",
+        "опиши ", "описание ", "информация про", "характеристики ",
     ],
 }
 
@@ -812,6 +889,19 @@ SYSTEM_PROMPT = """### РОЛЬ И КОНТЕКСТ
 
 ### КОНТЕКСТ ИЗ БАЗЫ ЗНАНИЙ
 {context}
+
+### ИНФОРМАЦИОННЫЕ ЗАПРОСЫ О ТОВАРЕ
+Если клиент спрашивает «расскажи про …», «что такое …», «чем отличается …»:
+- Отвечай **только** по фактам из блока «КОНТЕКСТ ИЗ БАЗЫ ЗНАНИЙ». Не добавляй размеры, материалы и характеристики, которых нет в контексте.
+- Кратко (обычно 3–5 предложений): назначение, 1–2 плюса из описания или характеристик, если они есть в контексте.
+- Не копируй сырые таблицы; переформулируй простым языком.
+- Если в контексте нет нужного товара или данных мало — честно скажи об этом и предложи связаться с менеджером (телефон в системе), не выдумывай.
+
+### СРАВНЕНИЕ
+Сравнивай только если в контексте есть оба (или все) сравниваемых объекта. Иначе — укажи, чего не хватает, без фантазии.
+
+### КОМПЛЕКТАЦИЯ И АКСЕССУАРЫ
+Не предлагай аксессуары и совместимость, если их нет в контексте каталога.
 
 ### СТИЛЬ: Деловой, экспертный. Маркированные списки. **Жирным** — названия и цены. Русский язык.
 """

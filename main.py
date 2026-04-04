@@ -41,6 +41,7 @@ from config import (
     SALES_ARGS,
     SLOT_GRILLE_SUBCAT_FILTER,
     SLOT_SERIES,
+    SLOT_GKL_REQUIRED_KEYS,
     SLOT_STEPS,
     STATIC_DIR,
     SUBCATEGORY_RULES,
@@ -307,31 +308,84 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
     )
 
 
+_GRILLE_INVALID_HINT = (
+    "Не удалось распознать ответ. Выберите вариант на кнопке ниже или задайте вопрос о товаре "
+    "(например: «расскажи про …», «что такое …»).\n\n"
+)
+
+
+def _grille_reask_current(session_id: str) -> ChatResponse:
+    """Повторяет вопрос Smart Routing без изменения состояния сессии."""
+    session = _get_session(session_id)
+    phase = session["grille_phase"]
+    subcats = session["allowed_subcats"]
+    location = session["active_filters"].get("location", "")
+    prefix = _GRILLE_INVALID_HINT
+    if phase == "mount":
+        mount_opts = _grille_mount_options(location, subcats)
+        buttons = [ButtonOption(label=o["label"], value=o["value"]) for o in mount_opts]
+        return ChatResponse(
+            reply=prefix + "Как будет выполнен монтаж решетки?",
+            action=ChatAction.ASK_QUESTION,
+            buttons=buttons,
+        )
+    if phase == "feature":
+        feat_opts = _grille_feature_options(subcats)
+        buttons = [ButtonOption(label=o["label"], value=o["value"]) for o in feat_opts]
+        return ChatResponse(
+            reply=prefix + "Какие требования к решетке?",
+            action=ChatAction.ASK_QUESTION,
+            buttons=buttons,
+        )
+    return _grille_advance(session_id)
+
+
 def _grille_handle_answer(session_id: str, message: str) -> ChatResponse:
     """Обрабатывает ответ на динамический шаг Smart Routing."""
     session = _get_session(session_id)
     phase = session["grille_phase"]
     location = session["active_filters"].get("location", "")
-
-    session["grille_routing"].append({
-        "step": phase,
-        "value": message,
-        "subcats_before": list(session["allowed_subcats"]),
-    })
+    subcats = session["allowed_subcats"]
 
     if phase == "mount":
-        subcats = _filter_subcats_by_mount(session["allowed_subcats"], location, message)
+        mount_opts = _grille_mount_options(location, subcats)
+        valid = next(
+            (o for o in mount_opts if o["value"] == message or o["label"] == message),
+            None,
+        )
+        if valid is None:
+            return _grille_reask_current(session_id)
+        chosen = valid["value"]
+        session["grille_routing"].append({
+            "step": phase,
+            "value": chosen,
+            "subcats_before": list(session["allowed_subcats"]),
+        })
+        subcats = _filter_subcats_by_mount(session["allowed_subcats"], location, chosen)
         session["allowed_subcats"] = subcats
         session["grille_phase"] = "mount_done"
         return _grille_advance(session_id)
 
     if phase == "feature":
-        subcats = _filter_subcats_by_feature(session["allowed_subcats"], message)
+        feat_opts = _grille_feature_options(subcats)
+        valid = next(
+            (o for o in feat_opts if o["value"] == message or o["label"] == message),
+            None,
+        )
+        if valid is None:
+            return _grille_reask_current(session_id)
+        chosen = valid["value"]
+        session["grille_routing"].append({
+            "step": phase,
+            "value": chosen,
+            "subcats_before": list(session["allowed_subcats"]),
+        })
+        subcats = _filter_subcats_by_feature(session["allowed_subcats"], chosen)
         session["allowed_subcats"] = subcats
         # Фильтр по характеристике с сайта: только Регулируемые или только Нерегулируемые
-        if message == "adjustable":
+        if chosen == "adjustable":
             session["active_filters"]["regulated"] = "regulated"
-        elif message == "fixed":
+        elif chosen == "fixed":
             session["active_filters"]["regulated"] = "fixed"
         else:
             session["active_filters"].pop("regulated", None)
@@ -1058,16 +1112,32 @@ def _recommend_series(session_id: str) -> str:
         mount = answers.get("facade_mount_type", "embedded")
         constr = answers.get("facade_construction", "standard")
         regulated = answers.get("facade_regulated", "fixed")
+        size = answers.get("facade_size", "")
         if regulated == "regulated":
             series = FACADE_SERIES.get("regulated", [])
         elif regulated == "inertial":
             series = FACADE_SERIES.get("inertial", [])
+        elif size == "under_2m2":
+            series = ["ВРН", "ВРН-Н"]
+        elif size == "over_2m2":
+            series = ["ВРН-У", "ВРН-НУ", "ВРН-С", "ВРН-НС"]
+        elif size == "over_4m2":
+            if constr == "reinforced_full":
+                series = ["РН-50", "ВРН-К", "НР-100"]
+            elif constr == "reinforced_frame":
+                series = ["ВРН-У", "ВРН-НУ", "ВРН-С", "ВРН-НС"]
+            else:
+                series = ["ВРН-У", "ВРН-НУ", "ВРН-С", "ВРН-НС"]
         else:
             key = f"{mount}_{constr}"
             series = FACADE_SERIES.get(key, [])
         if series:
             parts.append(f"Рекомендуемые серии: {', '.join(series)}")
-        if intents.get("mechanical_vent") or answers.get("facade_size") in ("over_2m2", "over_4m2"):
+        if (
+            regulated not in ("regulated", "inertial")
+            and size in ("over_2m2", "over_4m2")
+            and intents.get("mechanical_vent")
+        ):
             parts.append(SALES_ARGS["reinforced_recommendation"])
 
     elif branch == "indoor":
@@ -1080,7 +1150,7 @@ def _recommend_series(session_id: str) -> str:
 
     elif branch == "slot":
         mount = answers.get("slot_mount", "concealed")
-        if mount == "visible_frame":
+        if mount in ("visible_frame", "visible"):
             series = SLOT_SERIES.get("visible_frame", [])
         else:
             ceiling = answers.get("slot_ceiling_type", "gkl")
@@ -1094,6 +1164,14 @@ def _recommend_series(session_id: str) -> str:
 async def _detail_search(session_id: str) -> ChatResponse:
     """Выполняет поиск после завершения детальной ветки."""
     s = _get_session(session_id)
+    if (
+        s.get("detail_branch") == "slot"
+        and (s.get("detail_answers") or {}).get("slot_mount") == "concealed"
+        and (s.get("detail_answers") or {}).get("slot_ceiling_type") == "gkl"
+    ):
+        da = s.get("detail_answers") or {}
+        if any(k not in da for k in SLOT_GKL_REQUIRED_KEYS):
+            return await _detail_ask(session_id)
     # Подставляем в active_filters ответы из детальной ветки, используемые в метаданных ChromaDB
     if s.get("detail_branch") == "facade":
         answers = s.get("detail_answers") or {}
@@ -1196,6 +1274,111 @@ async def _detail_search(session_id: str) -> ChatResponse:
         reply="Под заданные параметры товаров не найдено. Рекомендую связаться с менеджером.",
         action=ChatAction.CONTACT_MANAGER,
     )
+
+
+
+
+def _is_explicit_product_info_query(message: str) -> bool:
+    """Явный запрос про товар (дополняет триггеры product_info)."""
+    lower = message.lower().strip()
+    if any(lower.startswith(p) for p in (
+        "расскажи", "расскажите", "что такое", "чем отличается", "опиши",
+        "характеристики", "информация про",
+    )):
+        return True
+    if "что за " in lower and len(lower) < 120:
+        return True
+    return False
+
+
+def _is_product_info_query(message: str) -> bool:
+    lower = message.lower()
+    for t in INTENT_TRIGGERS.get("product_info", []):
+        if t in lower:
+            return True
+    return False
+
+
+def _is_any_product_info_query(message: str) -> bool:
+    return _is_product_info_query(message) or _is_explicit_product_info_query(message)
+
+
+def _extract_product_subject(message: str) -> str:
+    t = message.strip()
+    for prefix in (
+        "расскажи про", "расскажите про", "что такое", "что за",
+        "чем отличается", "опиши", "описание", "информация про",
+        "характеристики",
+    ):
+        if t.lower().startswith(prefix):
+            t = t[len(prefix) :].strip(" :–-")
+            break
+    return t.strip()
+
+
+def _strict_slot_gkl_incomplete(session_id: str) -> bool:
+    s = _get_session(session_id)
+    if s.get("funnel_phase") != "detail" or s.get("detail_branch") != "slot":
+        return False
+    da = s.get("detail_answers") or {}
+    if da.get("slot_mount") != "concealed" or da.get("slot_ceiling_type") != "gkl":
+        return False
+    return any(k not in da for k in SLOT_GKL_REQUIRED_KEYS)
+
+
+async def _handle_product_info(session_id: str, message: str) -> ChatResponse:
+    s = _get_session(session_id)
+    subject = _extract_product_subject(message) or message
+    scenario = _get_scenario(session_id)
+    af = dict(s.get("active_filters") or {})
+    subcats = s.get("allowed_subcats") or None
+    results = _search_with_fallback(subject, af, scenario, subcats, n_results=8)
+    if not results:
+        return ChatResponse(
+            reply=(
+                "В каталоге не нашлось подходящих позиций по запросу. "
+                f"Уточните название или свяжитесь с менеджером: {MANAGER_CONTACTS['phone']}"
+            ),
+            action=ChatAction.CONTACT_MANAGER,
+        )
+    ctx = _build_context(results)
+    low_ctx = ctx.lower()
+    if "в базе знаний ничего не найдено" in low_ctx:
+        return ChatResponse(
+            reply=(
+                "По этому запросу мало данных в каталоге. "
+                f"Поможет менеджер: {MANAGER_CONTACTS['phone']}"
+            ),
+            action=ChatAction.CONTACT_MANAGER,
+        )
+    reply = await _ask_llm(
+        (
+            f"Запрос: {message}\n"
+            "Ответь кратко (3–5 предложений) только по фактам из контекста. "
+            "Если данных мало — скажи об этом."
+        ),
+        session_id,
+        ctx,
+    )
+    products = _product_data_list(results, n=5)
+    if not products:
+        return ChatResponse(
+            reply=(
+                "Не удалось сформировать карточки товаров по запросу. "
+                f"Свяжитесь с менеджером: {MANAGER_CONTACTS['phone']}"
+            ),
+            action=ChatAction.CONTACT_MANAGER,
+        )
+    return ChatResponse(reply=reply.strip(), action=ChatAction.SHOW_PRODUCT, products=products)
+
+
+async def _maybe_product_info_branch(session_id: str, message: str) -> ChatResponse | None:
+    if not _is_any_product_info_query(message):
+        return None
+    # Обход запрещён: при незаполненных обязательных полях ГКЛ (скрытая щелевая) — только уточнение.
+    if _strict_slot_gkl_incomplete(session_id):
+        return await _detail_ask(session_id)
+    return await _handle_product_info(session_id, message)
 
 
 def _handle_special_intent(session_id: str, message: str, intents: dict) -> ChatResponse | None:
@@ -1336,6 +1519,10 @@ async def process_message(request: ChatRequest) -> ChatResponse:
         scenario = _get_scenario(session_id)
 
         if scenario.get("dynamic") and session.get("grille_phase") in ("mount", "feature"):
+            if _is_any_product_info_query(message):
+                pinfo = await _maybe_product_info_branch(session_id, message)
+                if pinfo is not None:
+                    return pinfo
             return _grille_handle_answer(session_id, message)
 
         idx = session["step_idx"]
@@ -1430,6 +1617,17 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                     session["detail_answers"] = {}
                     return await _detail_ask(session_id)
 
+                if sk == "slot_grille":
+                    af = session["active_filters"]
+                    if af.get("slot_mount") == "concealed" and af.get("slot_ceiling_type") == "gkl":
+                        session["detail_branch"] = "slot"
+                        session["detail_step_idx"] = 0
+                        session["detail_answers"] = {
+                            "slot_mount": "concealed",
+                            "slot_ceiling_type": "gkl",
+                        }
+                        return await _detail_ask(session_id)
+
                 return await _do_filtered_search(session_id, _build_search_query(session_id))
 
     # ── Распознавание намерений ──
@@ -1440,6 +1638,10 @@ async def process_message(request: ChatRequest) -> ChatResponse:
     special = _handle_special_intent(session_id, message, intents)
     if special:
         return special
+
+    pinfo = await _maybe_product_info_branch(session_id, message)
+    if pinfo:
+        return pinfo
 
     # ── Умный анализ свободного текста ──
     extracted = _extract_filters_from_text(message)
