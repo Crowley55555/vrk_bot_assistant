@@ -300,8 +300,22 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
             subcats = _filter_subcats_by_mount(subcats, location, mount_opts[0]["value"])
             session["allowed_subcats"] = subcats
 
+    # ── После монтажа «в потолок (открытый)»: только reshetki-potolochnye.
+    # Иначе в subcats остаются перфорированные/сотовые/люки/дымоудаление/декор с разными feature —
+    # срабатывает шаг «Какие требования к решетке?», нерелевантный для потолочного каталога.
+    if phase in (None, "mount_done"):
+        subcats = session["allowed_subcats"]
+        mount_val = None
+        for item in reversed(session.get("grille_routing") or []):
+            if item.get("step") == "mount":
+                mount_val = item.get("value")
+                break
+        if mount_val == "ceiling_open" and "reshetki-potolochnye" in subcats:
+            session["allowed_subcats"] = ["reshetki-potolochnye"]
+
     # ── Шаг: Особенности (если >1 feature осталось) ──
     if phase in (None, "mount_done"):
+        subcats = session["allowed_subcats"]
         feat_opts = _grille_feature_options(subcats)
         if len(feat_opts) > 1:
             session["grille_phase"] = "feature"
@@ -2846,38 +2860,39 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                 session["active_filters"][key] = value
 
         if session.get("scenario_key") == "grille":
-            ceiling_hints = _extract_ceiling_hints(message)
-            if ceiling_hints and not _has_explicit_ceiling_exit_intent(message):
-                session["ceiling_hints"] = ceiling_hints
-                session["ceiling_source_text"] = message
-            if "grille_mount" in extracted or "grille_feature" in extracted:
-                extracted_for_routing = dict(extracted)
-                if (
-                    ceiling_hints
-                    and not _has_explicit_ceiling_exit_intent(message)
-                    and extracted_for_routing.get("grille_feature") in ("perforated", "honeycomb")
-                ):
-                    extracted_for_routing.pop("grille_feature", None)
-                _apply_grille_text_routing(session_id, extracted_for_routing)
-                narrowed_subcats = session.get("allowed_subcats") or []
-                if narrowed_subcats and all(slug == "reshetki-peretochnye" for slug in narrowed_subcats):
-                    session["active_filters"]["material"] = "aluminum"
-                    transfer_hint = _detect_transfer_execution_hint(message)
-                    if transfer_hint:
-                        session["transfer_execution_hint"] = transfer_hint
-            elif "location" in valid_filters:
-                session["allowed_subcats"] = _filter_subcats_by_location(valid_filters["location"])
-            if ceiling_hints and not _has_explicit_ceiling_exit_intent(message):
-                session["allowed_subcats"] = ["reshetki-potolochnye"]
-                session["active_filters"]["location"] = "indoor"
-                session["grille_phase"] = "done"
-                session["active_filters"].pop("regulated", None)
             explicit_redirect = _explicit_grille_redirect_subcats(message)
             if explicit_redirect:
                 session["allowed_subcats"] = explicit_redirect
                 session["grille_phase"] = "done"
                 session["ceiling_hints"] = {}
                 session["ceiling_source_text"] = ""
+            else:
+                ceiling_hints = _extract_ceiling_hints(message)
+                if ceiling_hints and not _has_explicit_ceiling_exit_intent(message):
+                    session["ceiling_hints"] = ceiling_hints
+                    session["ceiling_source_text"] = message
+                if "grille_mount" in extracted or "grille_feature" in extracted:
+                    extracted_for_routing = dict(extracted)
+                    if (
+                        ceiling_hints
+                        and not _has_explicit_ceiling_exit_intent(message)
+                        and extracted_for_routing.get("grille_feature") in ("perforated", "honeycomb")
+                    ):
+                        extracted_for_routing.pop("grille_feature", None)
+                    _apply_grille_text_routing(session_id, extracted_for_routing)
+                    narrowed_subcats = session.get("allowed_subcats") or []
+                    if narrowed_subcats and all(slug == "reshetki-peretochnye" for slug in narrowed_subcats):
+                        session["active_filters"]["material"] = "aluminum"
+                        transfer_hint = _detect_transfer_execution_hint(message)
+                        if transfer_hint:
+                            session["transfer_execution_hint"] = transfer_hint
+                elif "location" in valid_filters:
+                    session["allowed_subcats"] = _filter_subcats_by_location(valid_filters["location"])
+                if ceiling_hints and not _has_explicit_ceiling_exit_intent(message):
+                    session["allowed_subcats"] = ["reshetki-potolochnye"]
+                    session["active_filters"]["location"] = "indoor"
+                    session["grille_phase"] = "done"
+                    session["active_filters"].pop("regulated", None)
 
         # Mechanical vent trigger → inject sales arg
         if intents.get("mechanical_vent"):
