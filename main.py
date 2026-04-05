@@ -1350,6 +1350,61 @@ def _resolve_ceiling_model_for_search(answers: dict[str, Any]) -> str:
     return "any"
 
 
+_FOUR_WAY_PRIMARY_MARKERS: frozenset[str] = frozenset(
+    {"4pr", "4pr-s", "4sa", "4pp", "4ps", "4a"}
+)
+
+
+def _ceiling_direction_allowed_primary_markers(answers: dict[str, Any]) -> frozenset[str] | None:
+    """
+    Жёсткий набор допустимых primary-маркеров по ответу пользователя о направлении распределения.
+    None — не сужать (направление «не знаю» или шаг не пройден).
+    """
+    direction = (answers.get("ceiling_air_direction") or "").strip().lower()
+    if not direction or direction == "unknown":
+        return None
+    face = (answers.get("ceiling_face_type") or "").strip().lower()
+    material = (answers.get("ceiling_material") or "").strip().lower()
+    if direction == "one":
+        return frozenset({"1pr", "2prm"})
+    if direction == "two":
+        return frozenset({"2pr"})
+    if direction == "three":
+        return frozenset({"3pr"})
+    if direction == "four":
+        if face == "perforated":
+            return frozenset({"4pp"})
+        if face == "honeycomb":
+            return frozenset({"4ps"})
+        if face == "steel_strong":
+            return frozenset({"4pr-s"})
+        if face == "ordinary":
+            return frozenset({"4pr", "4sa", "4a"})
+        if face in ("", "unknown"):
+            if material == "galvanized":
+                return frozenset({"4pr-s"})
+            return _FOUR_WAY_PRIMARY_MARKERS
+        return _FOUR_WAY_PRIMARY_MARKERS
+    return None
+
+
+def _filter_ceiling_results_by_direction_allowed(
+    results: list[dict],
+    allowed: frozenset[str] | None,
+) -> list[dict]:
+    if not allowed:
+        return results
+    out: list[dict] = []
+    for r in results:
+        meta = (r.get("metadata") or {}) or {}
+        pm = _ceiling_primary_marker(meta)
+        if pm == "_other":
+            continue
+        if pm in allowed:
+            out.append(r)
+    return out
+
+
 def _ceiling_marker_candidates(meta: dict) -> set[str]:
     blob = " ".join(
         str(meta.get(k, "") or "")
@@ -2154,6 +2209,16 @@ async def _detail_search(session_id: str) -> ChatResponse:
                 )
                 results = recovered
                 ceiling_recovery_reason = "overconstrained_metadata"
+        allowed_dir_markers = _ceiling_direction_allowed_primary_markers(answers)
+        if allowed_dir_markers is not None:
+            _n_before_dir = len(results)
+            results = _filter_ceiling_results_by_direction_allowed(results, allowed_dir_markers)
+            log.info(
+                "ceiling direction family filter: allowed=%s | before=%d | after=%d",
+                sorted(allowed_dir_markers),
+                _n_before_dir,
+                len(results),
+            )
     if (
         s.get("detail_branch") == "indoor"
         and (s.get("detail_answers") or {}).get("indoor_type") == "transfer"
