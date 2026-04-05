@@ -360,14 +360,24 @@ FACADE_STEPS: list[dict] = [
         "applicable_when_not": {"facade_form": "round"},
     },
     {
-        "step_id": "facade_construction",
-        "question": "Что для вас важнее по прочности рамы и ламелей?",
+        "step_id": "facade_reinforced_frame",
+        "question": "Нужно усиление рамы?",
         "options": [
-            {"label": "Обычная (типовая) комплектация", "value": "standard"},
-            {"label": "Более жёсткая рама", "value": "reinforced_frame"},
-            {"label": "Максимальная жёсткость рамы и ламелей", "value": "reinforced_full"},
+            {"label": "Да, нужна усиленная рама", "value": "yes"},
+            {"label": "Нет, стандартной рамы достаточно", "value": "no"},
         ],
         "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_size": ["over_2m2", "over_4m2"]},
+    },
+    {
+        "step_id": "facade_reinforced_louvers",
+        "question": "Для больших размеров нужно усиление ламелей?",
+        "options": [
+            {"label": "Да, усиление ламелей требуется", "value": "yes"},
+            {"label": "Нет, усиление ламелей не требуется", "value": "no"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_size": "over_4m2"},
     },
     {
         "step_id": "facade_regulated",

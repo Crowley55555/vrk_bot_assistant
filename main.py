@@ -1154,7 +1154,11 @@ def _detail_step_applicable(step: dict, answers: dict) -> bool:
     if not cond:
         return True
     for key, required_val in cond.items():
-        if answers.get(key) != required_val:
+        actual = answers.get(key)
+        if isinstance(required_val, (list, tuple, set)):
+            if actual not in required_val:
+                return False
+        elif actual != required_val:
             return False
     return True
 
@@ -1181,6 +1185,16 @@ async def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
     s["detail_step_idx"] = idx
     s["funnel_phase"] = "detail"
     step = _get_detail_steps(s["detail_branch"])[idx]
+    if s.get("detail_branch") == "facade":
+        fsize = (s.get("detail_answers") or {}).get("facade_size")
+        if fsize:
+            log.info("facade detail: size selected = %s", fsize)
+            if fsize == "under_2m2":
+                log.info("facade detail: skipping reinforcement for under2m2")
+            elif fsize == "over_2m2" and step.get("step_id") == "facade_reinforced_frame":
+                log.info("facade detail: offering frame reinforcement only")
+            elif fsize == "over_4m2" and step.get("step_id") in ("facade_reinforced_frame", "facade_reinforced_louvers"):
+                log.info("facade detail: offering frame + louver reinforcement")
     log.info(
         "detail flow: asking step | branch=%s | step_id=%s | idx=%d",
         s.get("detail_branch"),
@@ -1222,25 +1236,29 @@ def _recommend_series(session_id: str) -> str:
 
     if branch == "facade":
         mount = answers.get("facade_mount_type", "embedded")
-        constr = answers.get("facade_construction", "standard")
+        # Backward compatibility: поддерживаем старый facade_construction и новую схему split-steps.
+        legacy_constr = answers.get("facade_construction", "")
+        if legacy_constr in ("standard", "reinforced_frame", "reinforced_full"):
+            constr = legacy_constr
+        else:
+            frame = answers.get("facade_reinforced_frame", "no")
+            louv = answers.get("facade_reinforced_louvers", "no")
+            if louv == "yes":
+                constr = "reinforced_full"
+            elif frame == "yes":
+                constr = "reinforced_frame"
+            else:
+                constr = "standard"
         regulated = answers.get("facade_regulated", "fixed")
         size = answers.get("facade_size", "")
         if regulated == "regulated":
             series = FACADE_SERIES.get("regulated", [])
         elif regulated == "inertial":
             series = FACADE_SERIES.get("inertial", [])
-        elif size == "under_2m2":
-            series = ["ВРН", "ВРН-Н"]
-        elif size == "over_2m2":
-            series = ["ВРН-У", "ВРН-НУ", "ВРН-С", "ВРН-НС"]
-        elif size == "over_4m2":
-            if constr == "reinforced_full":
-                series = ["РН-50", "ВРН-К", "НР-100"]
-            elif constr == "reinforced_frame":
-                series = ["ВРН-У", "ВРН-НУ", "ВРН-С", "ВРН-НС"]
-            else:
-                series = ["ВРН-У", "ВРН-НУ", "ВРН-С", "ВРН-НС"]
         else:
+            # under_2m2: шаги усиления не задаются, поэтому считаем типовую комплектацию.
+            if size == "under_2m2":
+                constr = "standard"
             key = f"{mount}_{constr}"
             series = FACADE_SERIES.get(key, [])
         if series:
