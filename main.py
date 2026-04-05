@@ -1313,6 +1313,43 @@ def _extract_ceiling_hints(text: str) -> dict[str, str]:
     return hints
 
 
+def _resolve_ceiling_model_for_search(answers: dict[str, Any]) -> str:
+    """
+    Внутренний marker для фильтрации по каталогу; пользователю не показывается как список кодов.
+    Явный ceiling_model из текста/хинтов имеет приоритет.
+    """
+    raw = (answers.get("ceiling_model") or "").strip().lower()
+    if raw and raw != "any":
+        return raw
+    direction = (answers.get("ceiling_air_direction") or "").strip().lower()
+    face = (answers.get("ceiling_face_type") or "").strip().lower()
+    material = (answers.get("ceiling_material") or "").strip().lower()
+
+    if direction in ("", "unknown"):
+        return "any"
+    if direction == "one":
+        return "any"
+    if direction == "two":
+        return "2pr"
+    if direction == "three":
+        return "3pr"
+    if direction == "four":
+        if face == "perforated":
+            return "4pp"
+        if face == "honeycomb":
+            return "4ps"
+        if face == "steel_strong":
+            return "4pr-s"
+        if face == "ordinary":
+            return "any"
+        if face in ("", "unknown"):
+            if material == "galvanized":
+                return "4pr-s"
+            return "any"
+        return "any"
+    return "any"
+
+
 def _ceiling_marker_candidates(meta: dict) -> set[str]:
     blob = " ".join(
         str(meta.get(k, "") or "")
@@ -1900,6 +1937,11 @@ async def _detail_search(session_id: str) -> ChatResponse:
         ceiling_size_bucket = (answers.get("ceiling_size_bucket") or "").strip()
         ceiling_material = (answers.get("ceiling_material") or "").strip()
         ceiling_valve = (answers.get("ceiling_valve") or "").strip()
+        if indoor_type == "ceiling":
+            da = dict(s.get("detail_answers") or {})
+            da["ceiling_model"] = _resolve_ceiling_model_for_search(da)
+            s["detail_answers"] = da
+            answers = da
         ceiling_model = (answers.get("ceiling_model") or "").strip()
         indoor_priority = (answers.get("indoor_priority") or "").strip()
         indoor_filling = (answers.get("indoor_filling") or "").strip()
@@ -2305,7 +2347,14 @@ async def _after_main_scenario_completed(session_id: str, user_message: str = ""
                 session["ceiling_hints"] = {}
             elif ceiling_only_indoor:
                 session["detail_answers"] = {"indoor_type": "ceiling"}
-                for k in ("ceiling_size_bucket", "ceiling_material", "ceiling_valve", "ceiling_model"):
+                for k in (
+                    "ceiling_size_bucket",
+                    "ceiling_material",
+                    "ceiling_valve",
+                    "ceiling_model",
+                    "ceiling_air_direction",
+                    "ceiling_face_type",
+                ):
                     if ceiling_hints.get(k):
                         session["detail_answers"][k] = ceiling_hints[k]
                 session["transfer_execution_hint"] = ""
