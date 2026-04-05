@@ -284,7 +284,7 @@ GRILLE_MOUNT_OPTIONS: dict[str, list[dict]] = {
         {"label": "На стену (открытый монтаж)", "mounts": ["wall"], "value": "wall_open"},
         {"label": "В потолок (открытый)", "mounts": ["ceiling"], "value": "ceiling_open"},
         {"label": "В потолок / стену (скрытый монтаж)", "mounts": ["ceiling_concealed", "wall_concealed"], "value": "concealed"},
-        {"label": "В перегородку / дверь (переток)", "mounts": ["door", "wall"], "value": "transfer"},
+        {"label": "В перегородку / дверь (переток)", "mounts": ["door"], "value": "transfer"},
         {"label": "В пол", "mounts": ["floor"], "value": "floor"},
     ],
 }

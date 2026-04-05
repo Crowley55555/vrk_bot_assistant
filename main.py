@@ -835,12 +835,18 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
     scenario = _get_scenario(session_id)
     query = user_message or _build_search_query(session_id)
     text_probe = (user_message or "").strip() or query
+    duct_direct_search = (
+        session.get("scenario_key") == "grille"
+        and (session.get("active_filters") or {}).get("location") == "duct"
+    )
     subcats = session.get("allowed_subcats") or None
     if session.get("scenario_key") == "slot_grille" and subcats:
         subcats = _filter_slot_grille_subcats(subcats, session["active_filters"])
     # Детали систем вентиляции (адаптеры и др.): больше результатов — в подкатегориях много позиций
     n_results = 15 if session.get("scenario_key") == "vent_parts" else 8
     results = _search_with_fallback(query, session["active_filters"], scenario, subcats, n_results=n_results)
+    where_dbg = _build_where_filter(session["active_filters"], subcats)
+    suppressed_by_entity_match = False
 
     entities = extract_product_entities(text_probe)
     sk = session.get("scenario_key")
@@ -879,22 +885,30 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
                 len(results),
             )
         else:
+            # Duct-ветка grille: если валидные результаты уже есть, не подавляем карточки из-за entity-check.
+            if not (duct_direct_search and len(results) >= 1):
+                suppressed_by_entity_match = True
+                log.info(
+                    "filtered search: no entity match | suppressing unrelated product cards | scenario=%s",
+                    sk,
+                )
+                ctx = _build_context([])
+                reply = await _ask_llm(
+                    (
+                        f"Запрос (поиск после воронки): {query}\n"
+                        "Точного совпадения по названию/серии из запроса в выдаче нет. "
+                        "Ответь кратко; не выдумывай товар."
+                    ),
+                    session_id,
+                    ctx,
+                )
+                _reset_funnel(session_id)
+                return ChatResponse(reply=reply.strip(), action=ChatAction.ASK_QUESTION)
             log.info(
-                "filtered search: no entity match | suppressing unrelated product cards | scenario=%s",
+                "filtered search: no entity match in duct direct search, keeping validated results | scenario=%s | n=%d",
                 sk,
+                len(results),
             )
-            ctx = _build_context([])
-            reply = await _ask_llm(
-                (
-                    f"Запрос (поиск после воронки): {query}\n"
-                    "Точного совпадения по названию/серии из запроса в выдаче нет. "
-                    "Ответь кратко; не выдумывай товар."
-                ),
-                session_id,
-                ctx,
-            )
-            _reset_funnel(session_id)
-            return ChatResponse(reply=reply.strip(), action=ChatAction.ASK_QUESTION)
     elif generic_cat:
         log.info(
             "filtered search: generic category query — multi-product OK | scenario=%s",
@@ -907,6 +921,14 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
         session["active_filters"],
         subcats[:5] if subcats else "all",
         len(results),
+    )
+    log.info(
+        "duct search diagnostics | query=%s | where=%s | validated_count=%d | suppressed_by_entity_match=%s | duct_direct_search=%s",
+        query,
+        where_dbg,
+        len(results),
+        suppressed_by_entity_match,
+        duct_direct_search,
     )
 
     context = _build_context(results)
