@@ -33,8 +33,13 @@ from config import (
     FUNNEL_SCENARIOS,
     GRILLE_FEATURE_LABELS,
     GRILLE_MOUNT_OPTIONS,
+    INDOOR_FILLING_QUERY_HINTS,
+    INDOOR_PRIORITY_QUERY_HINTS,
+    INDOOR_PRIORITY_SUBCAT_HINTS,
     INDOOR_SERIES,
     INDOOR_STEPS,
+    INDOOR_TYPE_QUERY_HINTS,
+    INDOOR_TYPE_SUBCAT_HINTS,
     INTENT_TRIGGERS,
     MAIN_CATEGORIES,
     MANAGER_CONTACTS,
@@ -1294,6 +1299,7 @@ def _recommend_series(session_id: str) -> str:
 async def _detail_search(session_id: str) -> ChatResponse:
     """Выполняет поиск после завершения детальной ветки."""
     s = _get_session(session_id)
+    indoor_query_additions: list[str] = []
     if (
         s.get("detail_branch") == "slot"
         and (s.get("detail_answers") or {}).get("slot_mount") == "concealed"
@@ -1398,9 +1404,64 @@ async def _detail_search(session_id: str) -> ChatResponse:
             s["active_filters"]["material"] = mat
         else:
             s["active_filters"].pop("material", None)
+    elif s.get("detail_branch") == "indoor":
+        answers = s.get("detail_answers") or {}
+        indoor_type = (answers.get("indoor_type") or "").strip()
+        indoor_priority = (answers.get("indoor_priority") or "").strip()
+        indoor_filling = (answers.get("indoor_filling") or "").strip()
+
+        current_subcats = s.get("allowed_subcats") or _filter_subcats_by_location("indoor")
+        current_subcats = [
+            slug
+            for slug in current_subcats
+            if "indoor" in SUBCATEGORY_RULES.get(slug, {}).get("location", [])
+        ]
+        narrowed = list(current_subcats)
+
+        type_hints = INDOOR_TYPE_SUBCAT_HINTS.get(indoor_type, [])
+        if type_hints:
+            by_type = [slug for slug in narrowed if slug in type_hints]
+            if by_type:
+                narrowed = by_type
+
+        priority_hints = INDOOR_PRIORITY_SUBCAT_HINTS.get(indoor_priority, [])
+        if priority_hints:
+            by_priority = [slug for slug in narrowed if slug in priority_hints]
+            if by_priority:
+                narrowed = by_priority
+
+        if narrowed:
+            s["allowed_subcats"] = narrowed
+
+        # indoor_filling влияет на метаданный фильтр regulated (где применимо в каталоге).
+        if indoor_filling in ("louvers", "deflector"):
+            s["active_filters"]["regulated"] = "regulated"
+        elif indoor_filling == "none":
+            s["active_filters"]["regulated"] = "fixed"
+        else:
+            s["active_filters"].pop("regulated", None)
+
+        for hint in (
+            INDOOR_TYPE_QUERY_HINTS.get(indoor_type, ""),
+            INDOOR_PRIORITY_QUERY_HINTS.get(indoor_priority, ""),
+            INDOOR_FILLING_QUERY_HINTS.get(indoor_filling, ""),
+        ):
+            if hint:
+                indoor_query_additions.append(hint)
+
+        log.info(
+            "indoor detail mapping: type=%s | priority=%s | filling=%s | subcats=%s | regulated=%s",
+            indoor_type or "-",
+            indoor_priority or "-",
+            indoor_filling or "-",
+            (s.get("allowed_subcats") or [])[:6],
+            s["active_filters"].get("regulated", ""),
+        )
 
     recommendation = _recommend_series(session_id)
     query = _build_search_query(session_id)
+    if indoor_query_additions:
+        query += " " + " ".join(indoor_query_additions)
     if recommendation:
         query += " " + recommendation.split(":")[1].strip() if ":" in recommendation else ""
 

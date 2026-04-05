@@ -529,6 +529,49 @@ INDOOR_SERIES: dict[str, list[str]] = {
     "high_kzhs": ["РН-40 (КЖС 0,518)", "НР-50 (КЖС 0,534)", "РН-40 увеличенный шаг (КЖС 0,7)"],
 }
 
+# Indoor detail mapping: ответы detail-ветки -> подкатегории/подсказки поиска.
+INDOOR_TYPE_SUBCAT_HINTS: dict[str, list[str]] = {
+    "regular": [
+        "ventiliacionnye-resetki",
+        "alyuminievye-dekorativnye-reshetki",
+        "reshetki-potolochnye",
+        "nereguliruemye",
+        "reguliruemye",
+        "sotovye-ventilyacionnye-resetki",
+        "setcatye-ventilyacionnye-resetki",
+        "perforirovannye-ventilyacionnye-resetki",
+    ],
+    "transfer": ["reshetki-peretochnye"],
+    "floor": ["napolnye-ventilyacionnye-resetki"],
+}
+
+INDOOR_PRIORITY_SUBCAT_HINTS: dict[str, list[str]] = {
+    "budget": ["ventiliacionnye-resetki", "nereguliruemye"],
+    "design": ["alyuminievye-dekorativnye-reshetki", "perforirovannye-ventilyacionnye-resetki"],
+    "premium": ["alyuminievye-dekorativnye-reshetki"],
+    "high_kzhs": ["sotovye-ventilyacionnye-resetki", "setcatye-ventilyacionnye-resetki"],
+}
+
+INDOOR_TYPE_QUERY_HINTS: dict[str, str] = {
+    "regular": "стеновая потолочная вентиляционная решетка",
+    "transfer": "переточная решетка для двери или перегородки",
+    "floor": "напольная вентиляционная решетка",
+}
+
+INDOOR_PRIORITY_QUERY_HINTS: dict[str, str] = {
+    "budget": "бюджетная серия адл",
+    "design": "декоративная дизайнерская серия dl",
+    "premium": "премиальная серия vl",
+    "high_kzhs": "высокий кжс повышенная пропускная способность",
+}
+
+INDOOR_FILLING_QUERY_HINTS: dict[str, str] = {
+    "none": "нерегулируемая без регулировки",
+    "louvers": "регулируемая с лопатками",
+    "deflector": "с дефлектором",
+    "removable": "со съемным полотном",
+}
+
 # ── Ветка «ЩЕЛЕВЫЕ РЕШЕТКИ» ──────────────────────────────────────────────────
 SLOT_STEPS: list[dict] = [
     {
