@@ -1546,10 +1546,33 @@ async def _after_main_scenario_completed(session_id: str, user_message: str = ""
     if sk == "grille":
         loc = af.get("location", "")
         if loc == "indoor":
+            subcats_now = session.get("allowed_subcats") or []
+            transfer_only_subcats = bool(subcats_now) and all(
+                slug == "reshetki-peretochnye" for slug in subcats_now
+            )
+            routing = session.get("grille_routing") or []
+            transfer_from_routing = any(
+                (item.get("step") in ("mount", "feature")) and item.get("value") == "transfer"
+                for item in routing
+            )
+            transfer_from_filters = (
+                af.get("grille_mount") == "transfer"
+                or af.get("grille_feature") == "transfer"
+            )
+            transfer_only_indoor = (
+                transfer_only_subcats
+                or transfer_from_routing
+                or transfer_from_filters
+            )
             session["detail_branch"] = "indoor"
             session["detail_step_idx"] = 0
-            session["detail_answers"] = {}
+            session["detail_answers"] = {"indoor_type": "transfer"} if transfer_only_indoor else {}
             session["funnel_phase"] = "detail"
+            if transfer_only_indoor:
+                log.info(
+                    "scenario flow: indoor transfer-only detected | prefill indoor_type=transfer | subcats=%s",
+                    subcats_now[:4],
+                )
             log.info("scenario flow: entering detail branch | branch=indoor")
             return await _detail_ask(session_id)
         if loc == "duct":
