@@ -501,6 +501,55 @@ INDOOR_STEPS: list[dict] = [
         ],
     },
     {
+        "step_id": "ceiling_size_bucket",
+        "question": "Какой типоразмер потолочной решетки нужен?",
+        "condition": {"indoor_type": "ceiling"},
+        "options": [
+            {"label": "600x600 / 595x595 / Armstrong", "value": "armstrong_600"},
+            {"label": "До 1000 мм", "value": "up_to_1000"},
+            {"label": "Более 1000 мм", "value": "over_1000"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "ceiling_material",
+        "question": "Какой материал потолочной решетки нужен?",
+        "condition": {"indoor_type": "ceiling"},
+        "options": [
+            {"label": "Алюминий", "value": "aluminum"},
+            {"label": "Сталь", "value": "galvanized"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "ceiling_valve",
+        "question": "Нужен клапан расхода воздуха (КРВ)?",
+        "condition": {"indoor_type": "ceiling"},
+        "options": [
+            {"label": "Да", "value": "yes"},
+            {"label": "Нет", "value": "no"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "ceiling_model",
+        "question": "Какой тип потолочного исполнения нужен?",
+        "condition": {"indoor_type": "ceiling"},
+        "options": [
+            {"label": "1ПР", "value": "1pr"},
+            {"label": "2ПР", "value": "2pr"},
+            {"label": "2ПРМ", "value": "2prm"},
+            {"label": "3ПР", "value": "3pr"},
+            {"label": "4ПР", "value": "4pr"},
+            {"label": "4ПР-С", "value": "4pr-s"},
+            {"label": "4СА", "value": "4sa"},
+            {"label": "4ПП", "value": "4pp"},
+            {"label": "4ПС", "value": "4ps"},
+            {"label": "4А", "value": "4a"},
+            {"label": "Не знаю / показать все", "value": "any"},
+        ],
+    },
+    {
         "step_id": "transfer_execution",
         "question": "Какой вариант переточной решетки нужен?",
         "condition": {"indoor_type": "transfer"},
@@ -514,7 +563,7 @@ INDOOR_STEPS: list[dict] = [
     {
         "step_id": "indoor_priority",
         "question": "Что для вас важнее?",
-        "applicable_when_not": {"indoor_type": "transfer"},
+        "condition": {"indoor_type": ["regular", "floor"]},
         "options": [
             {"label": "Цена (бюджетный вариант)", "value": "budget"},
             {"label": "Дизайн (декоративная)", "value": "design"},
@@ -525,7 +574,7 @@ INDOOR_STEPS: list[dict] = [
     {
         "step_id": "indoor_filling",
         "question": "Необходима ли регулировка потока воздуха?",
-        "applicable_when_not": {"indoor_type": "transfer"},
+        "condition": {"indoor_type": ["regular", "floor"]},
         "options": [
             {"label": "Нет, без регулировки", "value": "none"},
             {"label": "Да, с лопатками", "value": "louvers"},
@@ -556,6 +605,7 @@ INDOOR_TYPE_SUBCAT_HINTS: dict[str, list[str]] = {
     ],
     "transfer": ["reshetki-peretochnye"],
     "floor": ["napolnye-ventilyacionnye-resetki"],
+    "ceiling": ["reshetki-potolochnye"],
 }
 
 INDOOR_PRIORITY_SUBCAT_HINTS: dict[str, list[str]] = {
@@ -569,6 +619,7 @@ INDOOR_TYPE_QUERY_HINTS: dict[str, str] = {
     "regular": "стеновая потолочная вентиляционная решетка",
     "transfer": "переточная решетка для двери или перегородки",
     "floor": "напольная вентиляционная решетка",
+    "ceiling": "потолочная решетка armstrong 600x600 595x595",
 }
 
 INDOOR_PRIORITY_QUERY_HINTS: dict[str, str] = {

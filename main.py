@@ -88,6 +88,9 @@ _sessions: dict[str, dict[str, Any]] = defaultdict(lambda: {
     "detail_step_idx": 0,
     "detail_answers": {},       # ответы на шаги детальной ветки
     "transfer_execution_hint": "",
+    "ceiling_hints": {},
+    "ceiling_source_text": "",
+    "last_user_message": "",
     "detected_intents": {},     # analog, custom, mechanical_vent, budget, premium
 })
 
@@ -109,6 +112,9 @@ def _reset_funnel(session_id: str) -> None:
     s["detail_step_idx"] = 0
     s["detail_answers"] = {}
     s["transfer_execution_hint"] = ""
+    s["ceiling_hints"] = {}
+    s["ceiling_source_text"] = ""
+    s["last_user_message"] = ""
     s["detected_intents"] = {}
 
 
@@ -309,9 +315,14 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
     # ── Routing завершён → к статическим шагам ──
     session["grille_phase"] = "done"
     transfer_only = len(subcats) == 1 and subcats[0] == "reshetki-peretochnye"
+    ceiling_only = len(subcats) == 1 and subcats[0] == "reshetki-potolochnye"
     if transfer_only:
         # Для переточных решеток в каталоге используется алюминий — шаг material пропускаем.
         session["active_filters"]["material"] = "aluminum"
+        session["step_idx"] = 2  # size_group
+    elif ceiling_only:
+        # Для потолочной ветки сначала спрашиваем размер, материал уточняется в ceiling-detail.
+        session["active_filters"].pop("material", None)
         session["step_idx"] = 2  # size_group
     else:
         session["step_idx"] = 1  # material
@@ -1186,6 +1197,379 @@ def _filter_transfer_results_by_execution(results: list[dict], execution: str) -
     return filtered
 
 
+_CEILING_EXIT_HINTS: tuple[str, ...] = (
+    "переточ",
+    "в пол",
+    "наполь",
+    "дымоудал",
+    "люк",
+    "декоратив",
+)
+
+
+def _has_ceiling_intent(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in ("потолоч", "armstrong", "армстронг", "600x600", "595x595"))
+
+
+def _has_explicit_ceiling_exit_intent(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in _CEILING_EXIT_HINTS)
+
+
+def _explicit_grille_redirect_subcats(text: str) -> list[str] | None:
+    t = (text or "").lower()
+    if "переточ" in t:
+        return ["reshetki-peretochnye"]
+    if "в пол" in t or "наполь" in t:
+        return ["napolnye-ventilyacionnye-resetki"]
+    if "дымоудал" in t:
+        return ["dlya-klapanov-dymoudaleniya"]
+    if "люк" in t:
+        return ["lyuki-ventilyacionnye"]
+    if "декоратив" in t:
+        return ["alyuminievye-dekorativnye-reshetki"]
+    return None
+
+
+def _extract_ceiling_model_hint(text: str) -> str:
+    t = (text or "").lower()
+    ordered = [
+        ("4pr-s-r", [r"4\s*пр\s*-\s*с\s*-\s*р", r"4pr-s-r"]),
+        ("4pr-s", [r"4\s*пр\s*-\s*с", r"4pr-s"]),
+        ("2prm-r", [r"2\s*прм\s*-\s*р", r"2prm-r"]),
+        ("2prm", [r"2\s*прм", r"2prm"]),
+        ("4pp-r", [r"4\s*пп\s*-\s*р", r"4pp-r"]),
+        ("4ps-r", [r"4\s*пс\s*-\s*р", r"4ps-r"]),
+        ("4sa-r", [r"4\s*са\s*-\s*р", r"4sa-r"]),
+        ("4a-r", [r"4\s*а\s*-\s*р", r"4a-r"]),
+        ("4pr-r", [r"4\s*пр\s*-\s*р", r"4pr-r"]),
+        ("3pr-r", [r"3\s*пр\s*-\s*р", r"3pr-r"]),
+        ("2pr-r", [r"2\s*пр\s*-\s*р", r"2pr-r"]),
+        ("1pr-r", [r"1\s*пр\s*-\s*р", r"1pr-r"]),
+        ("4pp", [r"4\s*пп", r"4pp"]),
+        ("4ps", [r"4\s*пс", r"4ps"]),
+        ("4sa", [r"4\s*са", r"4sa"]),
+        ("4a", [r"4\s*а", r"4a"]),
+        ("4pr", [r"4\s*пр", r"4pr"]),
+        ("3pr", [r"3\s*пр", r"3pr"]),
+        ("2pr", [r"2\s*пр", r"2pr"]),
+        ("1pr", [r"1\s*пр", r"1pr"]),
+    ]
+    for marker, patterns in ordered:
+        if any(re.search(p, t) for p in patterns):
+            return marker
+    if "перфорирован" in t:
+        return "4pp"
+    if "сотов" in t:
+        return "4ps"
+    return ""
+
+
+def _extract_ceiling_hints(text: str) -> dict[str, str]:
+    t = (text or "").lower()
+    hints: dict[str, str] = {}
+    if not _has_ceiling_intent(t):
+        return hints
+    hints["_ceiling_context"] = "yes"
+    if any(x in t for x in ("600x600", "595x595", "armstrong", "армстронг")):
+        hints["ceiling_size_bucket"] = "armstrong_600"
+    elif any(x in t for x in ("более 1000", "больше 1000", ">1000")):
+        hints["ceiling_size_bucket"] = "over_1000"
+    elif any(x in t for x in ("до 1000", "менее 1000", "<=1000")):
+        hints["ceiling_size_bucket"] = "up_to_1000"
+
+    if any(x in t for x in ("оцинк", "стальн", "стальная")):
+        hints["ceiling_material"] = "galvanized"
+    elif "алюмин" in t:
+        hints["ceiling_material"] = "aluminum"
+
+    if any(x in t for x in ("с клапаном", "клапан расхода воздуха", "крв", "-р")):
+        hints["ceiling_valve"] = "yes"
+    elif "без клапан" in t:
+        hints["ceiling_valve"] = "no"
+
+    marker = _extract_ceiling_model_hint(t)
+    if marker:
+        if marker.endswith("-r"):
+            hints["ceiling_model"] = marker[:-2]
+            hints["ceiling_valve"] = "yes"
+        else:
+            hints["ceiling_model"] = marker
+    return hints
+
+
+def _ceiling_marker_candidates(meta: dict) -> set[str]:
+    blob = " ".join(
+        str(meta.get(k, "") or "")
+        for k in ("name", "article", "url", "raw_attrs_json")
+    ).lower()
+    variants: set[str] = set()
+    marker = _extract_ceiling_model_hint(blob)
+    if marker:
+        variants.add(marker)
+        if marker.endswith("-r"):
+            variants.add(marker[:-2])
+    if any(x in blob for x in ("с клапаном", "клапан расхода воздуха", "крв")):
+        for base in ("1pr", "2pr", "2prm", "3pr", "4pr", "4pr-s", "4sa", "4pp", "4ps", "4a"):
+            if re.search(base.replace("pr", r"\s*пр").replace("-s", r"\s*-\s*с").replace("-r", r"\s*-\s*р"), blob):
+                variants.add(f"{base}-r")
+                variants.add(base)
+    return variants
+
+
+def _ceiling_blob(meta: dict) -> str:
+    return " ".join(
+        str(meta.get(k, "") or "")
+        for k in ("name", "article", "url", "raw_attrs_json")
+    ).lower().replace("ё", "е")
+
+
+def _ceiling_model_aliases(model_marker: str) -> tuple[str, ...]:
+    model = (model_marker or "").strip().lower()
+    alias_map: dict[str, tuple[str, ...]] = {
+        "1pr": ("1пр", "1pr", "1 пр"),
+        "2pr": ("2пр", "2pr", "2 пр"),
+        "2prm": ("2прм", "2prm", "2 прм"),
+        "3pr": ("3пр", "3pr", "3 пр"),
+        "4pr": ("4пр", "4pr", "4 пр"),
+        "4pr-s": ("4пр-с", "4pr-s", "4пр с", "4pr s", "стальная потолочная"),
+        "4sa": ("4са", "4sa", "4 са"),
+        "4pp": ("4пп", "4pp", "4 пп", "перфорирован"),
+        "4ps": ("4пс", "4ps", "4 пс", "сотов"),
+        "4a": ("4а", "4a", "4 а", "диффузорная 4а", "диффузор"),
+    }
+    return alias_map.get(model, (model,)) if model else ()
+
+
+def _ceiling_valve_aliases(valve: str) -> tuple[str, ...]:
+    mode = (valve or "").strip().lower()
+    if mode == "yes":
+        return ("-р", "с клапаном", "с крв", "клапан расхода воздуха")
+    if mode == "no":
+        return ("без клапана", "нерегулируем")
+    return ()
+
+
+def _ceiling_material_aliases(material: str) -> tuple[str, ...]:
+    m = (material or "").strip().lower()
+    if m == "aluminum":
+        return ("алюмини", "alum")
+    if m == "galvanized":
+        return ("сталь", "оцинк")
+    return ()
+
+
+def _ceiling_match_score(meta: dict, model_marker: str, valve: str, material: str) -> int:
+    blob = _ceiling_blob(meta)
+    candidates = _ceiling_marker_candidates(meta)
+    score = 0
+    for token in _ceiling_model_aliases(model_marker):
+        if token and token in blob:
+            score += 3
+    for token in _ceiling_valve_aliases(valve):
+        if token in blob:
+            score += 2
+    if (valve or "").strip().lower() == "yes" and any(c.endswith("-r") for c in candidates):
+        score += 4
+    if (valve or "").strip().lower() == "no" and any(c.endswith("-r") for c in candidates):
+        score -= 2
+    for token in _ceiling_material_aliases(material):
+        if token in blob:
+            score += 1
+    return score
+
+
+_NON_CEILING_SUBCATS: set[str] = {
+    "reshetki-peretochnye",
+    "napolnye-ventilyacionnye-resetki",
+    "perforirovannye-ventilyacionnye-resetki",
+    "sotovye-ventilyacionnye-resetki",
+    "alyuminievye-dekorativnye-reshetki",
+    "lyuki-ventilyacionnye",
+    "dlya-klapanov-dymoudaleniya",
+}
+
+
+def _is_ceiling_meta(meta: dict) -> bool:
+    category = str(meta.get("category", "") or "")
+    if category == "reshetki-potolochnye":
+        return True
+    if category in _NON_CEILING_SUBCATS:
+        return False
+    blob = _ceiling_blob(meta)
+    return ("reshetki-potolochnye" in blob) or ("потолоч" in blob)
+
+
+def _ceiling_only_guard(results: list[dict]) -> list[dict]:
+    return [r for r in results if _is_ceiling_meta((r.get("metadata", {}) or {}))]
+
+
+_CEILING_MARKER_ORDER: tuple[str, ...] = (
+    "1pr", "2pr", "2prm", "3pr", "4pr", "4pr-s", "4sa", "4pp", "4ps", "4a",
+)
+
+
+def _ceiling_primary_marker(meta: dict) -> str:
+    candidates = _ceiling_marker_candidates(meta)
+    for base in _CEILING_MARKER_ORDER:
+        if base in candidates:
+            return base
+    for base in _CEILING_MARKER_ORDER:
+        if f"{base}-r" in candidates:
+            return base
+    return "_other"
+
+
+def _ceiling_diversity_rerank(results: list[dict]) -> tuple[list[dict], bool, list[str]]:
+    if len(results) <= 1:
+        markers = sorted({
+            _ceiling_primary_marker((r.get("metadata", {}) or {}))
+            for r in results
+            if _ceiling_primary_marker((r.get("metadata", {}) or {})) != "_other"
+        })
+        return results, False, markers
+
+    grouped: dict[str, list[dict]] = {}
+    marker_order: list[str] = []
+    for r in results:
+        marker = _ceiling_primary_marker((r.get("metadata", {}) or {}))
+        if marker not in grouped:
+            grouped[marker] = []
+            marker_order.append(marker)
+        grouped[marker].append(r)
+
+    markers_no_other = [m for m in marker_order if m != "_other"]
+    if len(markers_no_other) <= 1:
+        return results, False, markers_no_other
+
+    out: list[dict] = []
+    while True:
+        progressed = False
+        for marker in marker_order:
+            bucket = grouped.get(marker, [])
+            if bucket:
+                out.append(bucket.pop(0))
+                progressed = True
+        if not progressed:
+            break
+    return out, True, markers_no_other
+
+
+def _ceiling_query_mode(selected_model: str, selected_valve: str, selected_size_bucket: str) -> str:
+    model = (selected_model or "").strip()
+    valve = (selected_valve or "").strip()
+    size_bucket = (selected_size_bucket or "").strip()
+    if model and model != "any":
+        return "model_specific"
+    if valve == "yes":
+        return "valve_broad"
+    if size_bucket in ("armstrong_600", "up_to_1000", "over_1000"):
+        return "size_broad"
+    return "broad"
+
+
+def _ceiling_overmatch_guard(model_marker: str, blob: str) -> bool:
+    marker = (model_marker or "").strip().lower()
+    if marker == "4pr":
+        if re.search(r"4\s*пр\s*-\s*с", blob) or "4pr-s" in blob:
+            return False
+    if marker == "2pr":
+        if re.search(r"2\s*прм", blob) or "2prm" in blob:
+            return False
+    return True
+
+
+def _filter_ceiling_results_by_marker(
+    results: list[dict],
+    model_marker: str,
+    valve: str,
+) -> tuple[list[dict], list[str], dict[str, Any]]:
+    guarded = _ceiling_only_guard(results)
+    marker = (model_marker or "").strip()
+    valve_mode = (valve or "").strip()
+    stats: dict[str, Any] = {
+        "strict_count": 0,
+        "relaxed_count": 0,
+        "nearest_count": 0,
+        "fallback_stage": "none",
+        "empty_reason": None,
+    }
+    if marker in ("", "any") and valve_mode in ("", "unknown"):
+        matched = sorted({m for r in guarded for m in _ceiling_marker_candidates((r.get("metadata", {}) or {}))})
+        stats["strict_count"] = len(guarded)
+        stats["fallback_stage"] = "none"
+        stats["empty_reason"] = "no_ceiling_candidates" if not guarded else None
+        return guarded, matched, stats
+
+    strict: list[dict] = []
+    for r in guarded:
+        meta = (r.get("metadata", {}) or {})
+        candidates = _ceiling_marker_candidates(meta)
+        if marker and marker not in ("", "any"):
+            if marker not in candidates and f"{marker}-r" not in candidates:
+                continue
+        if valve_mode == "yes":
+            if not any(c.endswith("-r") for c in candidates):
+                continue
+        elif valve_mode == "no":
+            if any(c.endswith("-r") for c in candidates):
+                continue
+        strict.append(r)
+    if strict:
+        matched = sorted({m for r in strict for m in _ceiling_marker_candidates((r.get("metadata", {}) or {}))})
+        stats["strict_count"] = len(strict)
+        stats["fallback_stage"] = "strict"
+        return strict, matched, stats
+
+    # Relaxed pass by aliases in text blob.
+    relaxed: list[dict] = []
+    model_tokens = _ceiling_model_aliases(marker)
+    valve_tokens = _ceiling_valve_aliases(valve_mode)
+    for r in guarded:
+        meta = (r.get("metadata", {}) or {})
+        blob = _ceiling_blob(meta)
+        if marker and marker not in ("", "any"):
+            if model_tokens and not any(t in blob for t in model_tokens):
+                continue
+            if not _ceiling_overmatch_guard(marker, blob):
+                continue
+        if valve_mode == "yes":
+            if valve_tokens and not any(t in blob for t in valve_tokens):
+                continue
+        elif valve_mode == "no":
+            if any(t in blob for t in _ceiling_valve_aliases("yes")):
+                continue
+        relaxed.append(r)
+    if relaxed:
+        matched = sorted({m for r in relaxed for m in _ceiling_marker_candidates((r.get("metadata", {}) or {}))})
+        stats["relaxed_count"] = len(relaxed)
+        stats["fallback_stage"] = "relaxed"
+        return relaxed, matched, stats
+
+    # Soft fallback: keep ceiling candidates, prioritize likely matches.
+    nearest = sorted(
+        guarded,
+        key=lambda r: _ceiling_match_score(
+            (r.get("metadata", {}) or {}),
+            marker,
+            valve_mode,
+            "",
+        ),
+        reverse=True,
+    )
+    matched = sorted({m for r in nearest for m in _ceiling_marker_candidates((r.get("metadata", {}) or {}))})
+    stats["nearest_count"] = len(nearest)
+    stats["fallback_stage"] = "nearest_ceiling" if nearest else "manager"
+    if not guarded:
+        stats["empty_reason"] = "no_ceiling_candidates"
+    elif valve_mode == "yes":
+        stats["empty_reason"] = "valve_only_no_match"
+    elif marker and marker not in ("", "any"):
+        stats["empty_reason"] = "strict_no_match_relaxed_no_match"
+    return nearest, matched, stats
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # РАСПОЗНАВАНИЕ НАМЕРЕНИЙ (Intent Recognition)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1358,6 +1742,15 @@ def _recommend_series(session_id: str) -> str:
             series = transfer_series_map.get(transfer_execution, transfer_series_map["any"])
             parts.append(f"Рекомендуемые исполнения: {', '.join(series)}")
             return "\n".join(parts)
+        if indoor_type == "ceiling":
+            model = (answers.get("ceiling_model") or "").strip()
+            valve = (answers.get("ceiling_valve") or "").strip()
+            if model and model != "any":
+                model_label = model.upper().replace("PR", "ПР").replace("SA", "СА").replace("PS", "ПС").replace("PP", "ПП")
+                if valve == "yes":
+                    model_label = f"{model_label}-Р"
+                parts.append(f"Рекомендуемое потолочное исполнение: {model_label}")
+            return "\n".join(parts)
         priority = answers.get("indoor_priority", "")
         if priority in INDOOR_SERIES:
             series = INDOOR_SERIES[priority]
@@ -1490,6 +1883,10 @@ async def _detail_search(session_id: str) -> ChatResponse:
         answers = s.get("detail_answers") or {}
         indoor_type = (answers.get("indoor_type") or "").strip()
         transfer_execution = (answers.get("transfer_execution") or "").strip()
+        ceiling_size_bucket = (answers.get("ceiling_size_bucket") or "").strip()
+        ceiling_material = (answers.get("ceiling_material") or "").strip()
+        ceiling_valve = (answers.get("ceiling_valve") or "").strip()
+        ceiling_model = (answers.get("ceiling_model") or "").strip()
         indoor_priority = (answers.get("indoor_priority") or "").strip()
         indoor_filling = (answers.get("indoor_filling") or "").strip()
         if indoor_type == "transfer":
@@ -1511,6 +1908,53 @@ async def _detail_search(session_id: str) -> ChatResponse:
                 transfer_execution or "any",
                 s.get("allowed_subcats"),
                 s["active_filters"].get("material", ""),
+            )
+        elif indoor_type == "ceiling":
+            s["allowed_subcats"] = ["reshetki-potolochnye"]
+            # ceiling size mapping -> metadata size_group
+            if ceiling_size_bucket == "over_1000":
+                s["active_filters"]["size_group"] = "large"
+            elif ceiling_size_bucket in ("armstrong_600", "up_to_1000"):
+                s["active_filters"]["size_group"] = "small"
+            # unknown: оставляем ранее выбранный size_group из шага сценария
+            if ceiling_material in ("aluminum", "galvanized"):
+                s["active_filters"]["material"] = ceiling_material
+            if ceiling_valve == "yes":
+                s["active_filters"]["regulated"] = "regulated"
+            elif ceiling_valve == "no":
+                s["active_filters"]["regulated"] = "fixed"
+            else:
+                s["active_filters"].pop("regulated", None)
+            indoor_query_additions.append("потолочная решетка")
+            size_hint_map = {
+                "armstrong_600": "600x600 595x595 armstrong",
+                "up_to_1000": "до 1000 мм",
+                "over_1000": "более 1000 мм",
+            }
+            mat_hint_map = {
+                "aluminum": "алюминиевая",
+                "galvanized": "стальная оцинкованная",
+            }
+            valve_hint_map = {
+                "yes": "с клапаном крв",
+                "no": "без клапана",
+            }
+            if size_hint_map.get(ceiling_size_bucket):
+                indoor_query_additions.append(size_hint_map[ceiling_size_bucket])
+            if mat_hint_map.get(ceiling_material):
+                indoor_query_additions.append(mat_hint_map[ceiling_material])
+            if valve_hint_map.get(ceiling_valve):
+                indoor_query_additions.append(valve_hint_map[ceiling_valve])
+            if ceiling_model and ceiling_model != "any":
+                indoor_query_additions.append(ceiling_model.replace("-", " "))
+            log.info(
+                "indoor ceiling mapping: size=%s | material=%s | valve=%s | model=%s | subcats=%s | filters=%s",
+                ceiling_size_bucket or "-",
+                ceiling_material or "-",
+                ceiling_valve or "-",
+                ceiling_model or "-",
+                s.get("allowed_subcats"),
+                {k: s["active_filters"].get(k, "") for k in ("size_group", "material", "regulated")},
             )
         else:
             current_subcats = s.get("allowed_subcats") or _filter_subcats_by_location("indoor")
@@ -1570,6 +2014,11 @@ async def _detail_search(session_id: str) -> ChatResponse:
 
     scenario = _get_scenario(session_id)
     subcats = s.get("allowed_subcats") or None
+    is_ceiling_detail = (
+        s.get("detail_branch") == "indoor"
+        and (s.get("detail_answers") or {}).get("indoor_type") == "ceiling"
+    )
+    detail_n_results = 25 if is_ceiling_detail else 8
     log.info(
         "Поиск (detail %s) | filters=%s | subcats=%s",
         s.get("detail_branch", "?"),
@@ -1578,8 +2027,77 @@ async def _detail_search(session_id: str) -> ChatResponse:
     )
     results = _search_with_fallback(
         query, s["active_filters"], scenario, subcats,
+        n_results=detail_n_results,
         detail_branch=s.get("detail_branch"),
     )
+    ceiling_recovery_reason = ""
+    if (
+        s.get("detail_branch") == "indoor"
+        and (s.get("detail_answers") or {}).get("indoor_type") == "ceiling"
+    ):
+        answers = s.get("detail_answers") or {}
+        selected_model = (answers.get("ceiling_model") or "").strip()
+        selected_valve = (answers.get("ceiling_valve") or "").strip()
+        selected_size_bucket = (answers.get("ceiling_size_bucket") or "").strip()
+        query_mode = _ceiling_query_mode(selected_model, selected_valve, selected_size_bucket)
+        broad_ceiling_mode = query_mode != "model_specific"
+        base_count = len(results)
+        results = _ceiling_only_guard(results)
+        if base_count > len(results):
+            log.info(
+                "ceiling-only guard: dropped_non_ceiling=%d | remaining=%d",
+                base_count - len(results),
+                len(results),
+            )
+        # Для model-specific ceiling запросов не оставляем retrieval слишком узким.
+        if query_mode == "model_specific" and len(results) <= 1:
+            relaxed_filters = dict(s["active_filters"])
+            # Для уже распознанной ceiling-модели не обнуляем сценарий при слишком узких material/size/regulated.
+            for k in ("size_group", "material", "regulated"):
+                relaxed_filters.pop(k, None)
+            recovered = _search_with_fallback(
+                query,
+                relaxed_filters,
+                scenario,
+                subcats,
+                n_results=detail_n_results,
+                detail_branch=s.get("detail_branch"),
+            )
+            recovered = _ceiling_only_guard(recovered)
+            if len(recovered) > len(results):
+                log.info(
+                    "ceiling retrieval soft-recovery: model=%s | base_count=%d | relaxed_filters_used=%s | recovered_count=%d",
+                    selected_model,
+                    len(results),
+                    ["size_group", "material", "regulated"],
+                    len(recovered),
+                )
+                results = recovered
+                ceiling_recovery_reason = "overconstrained_metadata"
+        elif broad_ceiling_mode and len(results) <= 1:
+            relaxed_filters = dict(s["active_filters"])
+            if "size_group" in relaxed_filters:
+                relaxed_filters.pop("size_group", None)
+            if selected_valve != "yes":
+                relaxed_filters.pop("regulated", None)
+            recovered = _search_with_fallback(
+                query,
+                relaxed_filters,
+                scenario,
+                subcats,
+                n_results=detail_n_results,
+                detail_branch=s.get("detail_branch"),
+            )
+            recovered = _ceiling_only_guard(recovered)
+            if len(recovered) > len(results):
+                log.info(
+                    "ceiling retrieval broad-recovery: query_mode=%s | base_count=%d | recovered_count=%d",
+                    query_mode,
+                    len(results),
+                    len(recovered),
+                )
+                results = recovered
+                ceiling_recovery_reason = "overconstrained_metadata"
     if (
         s.get("detail_branch") == "indoor"
         and (s.get("detail_answers") or {}).get("indoor_type") == "transfer"
@@ -1599,6 +2117,83 @@ async def _detail_search(session_id: str) -> ChatResponse:
                 len(results),
                 matched_markers,
             )
+    if (
+        s.get("detail_branch") == "indoor"
+        and (s.get("detail_answers") or {}).get("indoor_type") == "ceiling"
+    ):
+        answers = s.get("detail_answers") or {}
+        selected_size_bucket = (answers.get("ceiling_size_bucket") or "").strip()
+        selected_material = (answers.get("ceiling_material") or "").strip()
+        selected_model = (answers.get("ceiling_model") or "").strip()
+        selected_valve = (answers.get("ceiling_valve") or "").strip()
+        query_mode = _ceiling_query_mode(selected_model, selected_valve, selected_size_bucket)
+        broad_ceiling_mode = query_mode != "model_specific"
+        retrieval_count_before = len(results)
+        results, matched_markers, ceiling_stats = _filter_ceiling_results_by_marker(
+            results,
+            selected_model,
+            selected_valve,
+        )
+        strict_matches_count = int(ceiling_stats.get("strict_count", 0))
+        relaxed_matches_count = int(ceiling_stats.get("relaxed_count", 0))
+        nearest_ceiling_candidates_count = int(ceiling_stats.get("nearest_count", 0))
+        fallback_stage = str(ceiling_stats.get("fallback_stage", "none") or "none")
+        empty_reason = ceiling_stats.get("empty_reason")
+
+        diversity_applied = False
+        final_result_markers: list[str] = sorted({
+            _ceiling_primary_marker((r.get("metadata", {}) or {}))
+            for r in results
+            if _ceiling_primary_marker((r.get("metadata", {}) or {})) != "_other"
+        })
+        if broad_ceiling_mode:
+            results, diversity_applied, final_result_markers = _ceiling_diversity_rerank(results)
+
+        if results:
+            empty_reason = None
+        else:
+            fallback_stage = "manager"
+            if empty_reason is None:
+                if retrieval_count_before == 0:
+                    empty_reason = "no_ceiling_candidates"
+                elif ceiling_recovery_reason:
+                    empty_reason = ceiling_recovery_reason
+                elif selected_valve == "yes":
+                    empty_reason = "valve_only_no_match"
+                elif query_mode == "model_specific":
+                    empty_reason = "strict_no_match_relaxed_no_match"
+                else:
+                    empty_reason = "strict_no_match_relaxed_no_match"
+        log.info(
+            "indoor ceiling model filter: selected_model=%s | selected_valve=%s | before_count=%d | after_count=%d | matched_markers=%s | allowed_subcats=%s",
+            selected_model or "-",
+            selected_valve or "-",
+            retrieval_count_before,
+            len(results),
+            matched_markers,
+            s.get("allowed_subcats"),
+        )
+        log.info(
+            "ceiling search debug: query_mode=%s | broad_ceiling_mode=%s | original_text=%s | selected_model=%s | selected_valve=%s | selected_material=%s | selected_size_bucket=%s | query_hints=%s | allowed_subcats=%s | retrieval_count_before_marker_filter=%d | strict_marker_matches_count=%d | relaxed_marker_matches_count=%d | nearest_ceiling_candidates_count=%d | diversity_applied=%s | final_result_markers=%s | final_products_count=%d | fallback_stage_used=%s | empty_reason=%s",
+            query_mode,
+            "yes" if broad_ceiling_mode else "no",
+            (s.get("ceiling_source_text") or s.get("last_user_message") or "").strip(),
+            selected_model or "-",
+            selected_valve or "-",
+            selected_material or "-",
+            selected_size_bucket or "-",
+            indoor_query_additions,
+            s.get("allowed_subcats"),
+            retrieval_count_before,
+            strict_matches_count,
+            relaxed_matches_count,
+            nearest_ceiling_candidates_count,
+            "yes" if diversity_applied else "no",
+            final_result_markers,
+            len(results),
+            fallback_stage,
+            empty_reason,
+        )
     context = _build_context(results)
 
     extra_context = ""
@@ -1650,19 +2245,35 @@ async def _after_main_scenario_completed(session_id: str, user_message: str = ""
             transfer_only_subcats = bool(subcats_now) and all(
                 slug == "reshetki-peretochnye" for slug in subcats_now
             )
+            ceiling_only_subcats = bool(subcats_now) and all(
+                slug == "reshetki-potolochnye" for slug in subcats_now
+            )
             routing = session.get("grille_routing") or []
             transfer_from_routing = any(
                 (item.get("step") in ("mount", "feature")) and item.get("value") == "transfer"
+                for item in routing
+            )
+            ceiling_from_routing = any(
+                item.get("step") == "mount" and item.get("value") in ("ceiling_open", "concealed")
                 for item in routing
             )
             transfer_from_filters = (
                 af.get("grille_mount") == "transfer"
                 or af.get("grille_feature") == "transfer"
             )
+            ceiling_hints = dict(session.get("ceiling_hints") or {})
             transfer_only_indoor = (
                 transfer_only_subcats
                 or transfer_from_routing
                 or transfer_from_filters
+            )
+            ceiling_only_indoor = (
+                not transfer_only_indoor
+                and (
+                    ceiling_only_subcats
+                    or ceiling_from_routing
+                    or bool(ceiling_hints)
+                )
             )
             transfer_exec_hint = ""
             if transfer_only_indoor:
@@ -1677,15 +2288,31 @@ async def _after_main_scenario_completed(session_id: str, user_message: str = ""
                 if transfer_exec_hint:
                     session["detail_answers"]["transfer_execution"] = transfer_exec_hint
                 session["transfer_execution_hint"] = ""
+                session["ceiling_hints"] = {}
+            elif ceiling_only_indoor:
+                session["detail_answers"] = {"indoor_type": "ceiling"}
+                for k in ("ceiling_size_bucket", "ceiling_material", "ceiling_valve", "ceiling_model"):
+                    if ceiling_hints.get(k):
+                        session["detail_answers"][k] = ceiling_hints[k]
+                session["transfer_execution_hint"] = ""
+                session["ceiling_hints"] = {}
+                session["allowed_subcats"] = ["reshetki-potolochnye"]
             else:
                 session["detail_answers"] = {}
                 session["transfer_execution_hint"] = ""
+                session["ceiling_hints"] = {}
             session["funnel_phase"] = "detail"
             if transfer_only_indoor:
                 log.info(
                     "scenario flow: indoor transfer-only detected | prefill indoor_type=transfer, transfer_execution=%s | subcats=%s",
                     transfer_exec_hint or "-",
                     subcats_now[:4],
+                )
+            if ceiling_only_indoor:
+                log.info(
+                    "scenario flow: indoor ceiling-only detected | prefill=%s | subcats=%s",
+                    session.get("detail_answers"),
+                    session.get("allowed_subcats"),
                 )
             log.info("scenario flow: entering detail branch | branch=indoor")
             return await _detail_ask(session_id)
@@ -1967,6 +2594,7 @@ async def process_message(request: ChatRequest) -> ChatResponse:
     session_id = request.session_id
     message = request.message.strip()
     session = _get_session(session_id)
+    session["last_user_message"] = message
 
     # ── Навигация ──
     if message == "__main_menu__":
@@ -2185,6 +2813,11 @@ async def process_message(request: ChatRequest) -> ChatResponse:
         scenario = FUNNEL_SCENARIOS.get(scenario_key, FUNNEL_SCENARIOS["_default"])
 
         valid_filters, warnings = _validate_extracted(extracted, scenario, message)
+        if _has_ceiling_intent(message) and not _has_explicit_ceiling_exit_intent(message):
+            # Потолочные запросы закрепляем за grille indoor до явного выхода пользователя.
+            valid_filters["product_type"] = "grille"
+            if not valid_filters.get("location"):
+                valid_filters["location"] = "indoor"
 
         # Excluded categories
         excluded_pt = valid_filters.get("product_type", "")
@@ -2213,8 +2846,19 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                 session["active_filters"][key] = value
 
         if session.get("scenario_key") == "grille":
+            ceiling_hints = _extract_ceiling_hints(message)
+            if ceiling_hints and not _has_explicit_ceiling_exit_intent(message):
+                session["ceiling_hints"] = ceiling_hints
+                session["ceiling_source_text"] = message
             if "grille_mount" in extracted or "grille_feature" in extracted:
-                _apply_grille_text_routing(session_id, extracted)
+                extracted_for_routing = dict(extracted)
+                if (
+                    ceiling_hints
+                    and not _has_explicit_ceiling_exit_intent(message)
+                    and extracted_for_routing.get("grille_feature") in ("perforated", "honeycomb")
+                ):
+                    extracted_for_routing.pop("grille_feature", None)
+                _apply_grille_text_routing(session_id, extracted_for_routing)
                 narrowed_subcats = session.get("allowed_subcats") or []
                 if narrowed_subcats and all(slug == "reshetki-peretochnye" for slug in narrowed_subcats):
                     session["active_filters"]["material"] = "aluminum"
@@ -2223,6 +2867,17 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                         session["transfer_execution_hint"] = transfer_hint
             elif "location" in valid_filters:
                 session["allowed_subcats"] = _filter_subcats_by_location(valid_filters["location"])
+            if ceiling_hints and not _has_explicit_ceiling_exit_intent(message):
+                session["allowed_subcats"] = ["reshetki-potolochnye"]
+                session["active_filters"]["location"] = "indoor"
+                session["grille_phase"] = "done"
+                session["active_filters"].pop("regulated", None)
+            explicit_redirect = _explicit_grille_redirect_subcats(message)
+            if explicit_redirect:
+                session["allowed_subcats"] = explicit_redirect
+                session["grille_phase"] = "done"
+                session["ceiling_hints"] = {}
+                session["ceiling_source_text"] = ""
 
         # Mechanical vent trigger → inject sales arg
         if intents.get("mechanical_vent"):
@@ -2244,6 +2899,13 @@ async def process_message(request: ChatRequest) -> ChatResponse:
         )
 
         if next_idx is not None:
+            if (
+                session.get("scenario_key") == "grille"
+                and (session.get("allowed_subcats") or []) == ["reshetki-potolochnye"]
+                and next_idx == 1
+            ):
+                # Ceiling-flow: первым практическим шагом оставляем size_group.
+                next_idx = 2
             if session.get("scenario_key") == "grille" and not is_grille_routing_done:
                 if next_idx == 0:
                     pass
