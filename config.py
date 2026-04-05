@@ -326,6 +326,18 @@ FACADE_STEPS: list[dict] = [
         ],
     },
     {
+        "step_id": "facade_solution_type",
+        "question": "Какой тип фасадной решётки нужен?",
+        "options": [
+            {"label": "Стандартная фасадная", "value": "standard"},
+            {"label": "Регулируемая", "value": "regulated"},
+            {"label": "Для обслуживания вентканала", "value": "service"},
+            {"label": "Инерционная", "value": "inertial"},
+            {"label": "С высоким КЖС", "value": "high_kzhs"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+    },
+    {
         "step_id": "facade_material",
         "question": "Какой материал решётки нужен?",
         "options": [
@@ -335,6 +347,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Не важно", "value": ""},
         ],
         "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "standard"},
     },
     {
         "step_id": "facade_mount_type",
@@ -348,6 +361,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Накладная (без фланца)", "value": "surface"},
         ],
         "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "standard"},
     },
     {
         "step_id": "facade_size",
@@ -358,6 +372,31 @@ FACADE_STEPS: list[dict] = [
             {"label": "Более 4 м²", "value": "over_4m2"},
         ],
         "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "standard"},
+    },
+    {
+        "step_id": "facade_mechanical_vent",
+        "question": "У вас принудительная вентиляция?",
+        "options": [
+            {"label": "Да, есть механическая вентиляция", "value": "yes"},
+            {"label": "Нет, только декоративная функция", "value": "no"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "standard", "facade_size": "over_4m2"},
+    },
+    {
+        "step_id": "facade_over4m2_priority",
+        "question": "Что важнее для вас: цена или жесткость конструкции?",
+        "options": [
+            {"label": "Важна цена", "value": "price"},
+            {"label": "Важна жесткость конструкции", "value": "rigidity"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+        "condition": {
+            "facade_solution_type": "standard",
+            "facade_size": "over_4m2",
+            "facade_mechanical_vent": "yes",
+        },
     },
     {
         "step_id": "facade_reinforced_frame",
@@ -367,7 +406,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Нет, стандартной рамы достаточно", "value": "no"},
         ],
         "applicable_when_not": {"facade_form": "round"},
-        "condition": {"facade_size": ["over_2m2", "over_4m2"]},
+        "condition": {"facade_solution_type": "standard", "facade_size": "over_2m2"},
     },
     {
         "step_id": "facade_reinforced_louvers",
@@ -377,7 +416,12 @@ FACADE_STEPS: list[dict] = [
             {"label": "Нет, усиление ламелей не требуется", "value": "no"},
         ],
         "applicable_when_not": {"facade_form": "round"},
-        "condition": {"facade_size": "over_4m2"},
+        "condition": {
+            "facade_solution_type": "standard",
+            "facade_size": "over_4m2",
+            "facade_mechanical_vent": "yes",
+            "facade_over4m2_priority": "rigidity",
+        },
     },
     {
         "step_id": "facade_regulated",
@@ -385,21 +429,43 @@ FACADE_STEPS: list[dict] = [
         "options": [
             {"label": "Нет, нерегулируемая", "value": "fixed"},
             {"label": "Да, регулируемая", "value": "regulated"},
-            {"label": "Инерционная (с обратным клапаном)", "value": "inertial"},
         ],
         "applicable_when_not": {"facade_form": "round", "facade_mount_type": "surface"},
+        "condition": {"facade_solution_type": "standard"},
+    },
+    {
+        "step_id": "facade_inertial_fan_context",
+        "question": "Для инерционной решетки: какая производительность вентилятора и на каком расстоянии он установлен?",
+        "options": [
+            {"label": "Вентилятор рядом / высокая производительность", "value": "near_high"},
+            {"label": "Средняя производительность / средняя дистанция", "value": "mid"},
+            {"label": "Вентилятор далеко / нужна консультация", "value": "far_or_unknown"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "inertial"},
+    },
+    {
+        "step_id": "facade_high_kzhs_variant",
+        "question": "Для высокого КЖС нужна стандартная или нестандартная конструкция?",
+        "options": [
+            {"label": "Стандартная конструкция", "value": "standard"},
+            {"label": "Нестандартная конструкция", "value": "custom"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "high_kzhs"},
     },
 ]
 
 FACADE_SERIES: dict[str, list[str]] = {
-    "embedded_standard":        ["ВРН", "ВРН-К", "РН-50"],
-    "embedded_reinforced_frame": ["ВРН-У"],
-    "embedded_reinforced_full":  ["ВРН-С", "ВРЖС"],
-    "surface_standard":          ["ВРН-Н", "НР-100"],
-    "surface_reinforced_frame":  ["ВРН-НУ"],
-    "surface_reinforced_full":   ["ВРН-НС"],
-    "regulated":                 ["ВРН-Р"],
-    "inertial":                  ["ИР", "ИР-Н", "ИР-У", "ИР-НУ"],
+    "standard_under_2m2": ["ВРН", "ВРН-Н"],
+    "standard_over_2m2": ["ВРН-У", "ВРН-НУ", "ВРН-С", "ВРН-НС"],
+    "standard_over_4m2_price": ["ВРН-У", "ВРН-НУ", "ВРН-С", "ВРН-НС"],
+    "standard_over_4m2_rigidity": ["РН-50", "ВРН-К", "НР-100"],
+    "regulated": ["ВРН-Р"],
+    "service": ["ВРЖС"],
+    "inertial": ["ИР", "ИР-Н", "ИР-У", "ИР-НУ"],
+    "high_kzhs_standard": ["РН-40 (КЖС 0.518)", "НР-50 (КЖС 0.534)"],
+    "high_kzhs_custom": ["РН-40 (увеличенный шаг ламелей, КЖС 0.7)"],
 }
 
 # ── Ветка «АКУСТИЧЕСКИЕ РЕШЁТКИ» (отдельный сценарий в категории Вентиляционные решетки) ──

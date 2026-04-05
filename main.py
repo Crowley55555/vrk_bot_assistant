@@ -1235,37 +1235,37 @@ def _recommend_series(session_id: str) -> str:
     parts: list[str] = []
 
     if branch == "facade":
-        mount = answers.get("facade_mount_type", "embedded")
-        # Backward compatibility: поддерживаем старый facade_construction и новую схему split-steps.
-        legacy_constr = answers.get("facade_construction", "")
-        if legacy_constr in ("standard", "reinforced_frame", "reinforced_full"):
-            constr = legacy_constr
-        else:
-            frame = answers.get("facade_reinforced_frame", "no")
-            louv = answers.get("facade_reinforced_louvers", "no")
-            if louv == "yes":
-                constr = "reinforced_full"
-            elif frame == "yes":
-                constr = "reinforced_frame"
-            else:
-                constr = "standard"
-        regulated = answers.get("facade_regulated", "fixed")
+        solution = answers.get("facade_solution_type", "standard")
         size = answers.get("facade_size", "")
-        if regulated == "regulated":
+        if solution == "regulated":
             series = FACADE_SERIES.get("regulated", [])
-        elif regulated == "inertial":
+        elif solution == "service":
+            series = FACADE_SERIES.get("service", [])
+        elif solution == "inertial":
             series = FACADE_SERIES.get("inertial", [])
+        elif solution == "high_kzhs":
+            kzhs_variant = answers.get("facade_high_kzhs_variant", "standard")
+            kzhs_key = "high_kzhs_custom" if kzhs_variant == "custom" else "high_kzhs_standard"
+            series = FACADE_SERIES.get(kzhs_key, [])
         else:
-            # under_2m2: шаги усиления не задаются, поэтому считаем типовую комплектацию.
             if size == "under_2m2":
-                constr = "standard"
-            key = f"{mount}_{constr}"
-            series = FACADE_SERIES.get(key, [])
+                series = FACADE_SERIES.get("standard_under_2m2", [])
+            elif size == "over_2m2":
+                series = FACADE_SERIES.get("standard_over_2m2", [])
+            elif size == "over_4m2":
+                mech = answers.get("facade_mechanical_vent", "no")
+                priority = answers.get("facade_over4m2_priority", "")
+                if mech == "yes" and priority == "rigidity":
+                    series = FACADE_SERIES.get("standard_over_4m2_rigidity", [])
+                else:
+                    series = FACADE_SERIES.get("standard_over_4m2_price", [])
+            else:
+                series = FACADE_SERIES.get("standard_under_2m2", [])
         if series:
             parts.append(f"Рекомендуемые серии: {', '.join(series)}")
         if (
-            regulated not in ("regulated", "inertial")
-            and size in ("over_2m2", "over_4m2")
+            solution == "standard"
+            and size in ("over_4m2",)
             and intents.get("mechanical_vent")
         ):
             parts.append(SALES_ARGS["reinforced_recommendation"])
@@ -1314,10 +1314,11 @@ async def _detail_search(session_id: str) -> ChatResponse:
     # Подставляем в active_filters ответы из детальной ветки, используемые в метаданных ChromaDB
     if s.get("detail_branch") == "facade":
         answers = s.get("detail_answers") or {}
+        solution = answers.get("facade_solution_type", "standard")
         regulated_val = answers.get("facade_regulated", "")
 
         # Привязка ответов фасадной ветки к фильтрам и подкатегориям (метаданные ChromaDB)
-        if regulated_val == "inertial":
+        if solution == "inertial":
             # Инерционная: только подкатегория «Инерционные» (category = reshetki-inertsionnye)
             s["allowed_subcats"] = [
                 slug for slug, r in SUBCATEGORY_RULES.items()
@@ -1326,6 +1327,30 @@ async def _detail_search(session_id: str) -> ChatResponse:
             s["active_filters"]["regulated"] = "fixed"
             # Форму/тип монтажа для инерционных не фильтруем — в БД может не быть этих полей по этой подкатегории
             s["active_filters"].pop("form", None)
+            s["active_filters"].pop("installation", None)
+        elif solution == "regulated":
+            s["active_filters"]["regulated"] = "regulated"
+            s["active_filters"].pop("form", None)
+            s["active_filters"].pop("installation", None)
+            # Регулируемые по feature из каталога
+            s["allowed_subcats"] = [
+                slug for slug, r in SUBCATEGORY_RULES.items()
+                if r.get("feature") == "adjustable"
+            ] or s.get("allowed_subcats", [])
+        elif solution == "service":
+            s["active_filters"]["regulated"] = "fixed"
+            s["active_filters"].pop("form", None)
+            s["active_filters"].pop("installation", None)
+            s["allowed_subcats"] = ["lyuki-ventilyacionnye"]
+        elif solution == "high_kzhs":
+            s["active_filters"]["regulated"] = "fixed"
+            s["active_filters"].pop("form", None)
+            s["active_filters"].pop("installation", None)
+            # В каталоге повышенная жесткость ближе всего к сотовым решеткам
+            s["allowed_subcats"] = [
+                slug for slug, r in SUBCATEGORY_RULES.items()
+                if r.get("feature") == "honeycomb"
+            ] or s.get("allowed_subcats", [])
         elif answers.get("facade_form") == "round":
             # Круглые решётки для фасада: только наружные (не ВКР «в воздуховод»)
             s["active_filters"]["product_type"] = "grille"
