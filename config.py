@@ -501,8 +501,20 @@ INDOOR_STEPS: list[dict] = [
         ],
     },
     {
+        "step_id": "transfer_execution",
+        "question": "Какой вариант переточной решетки нужен?",
+        "condition": {"indoor_type": "transfer"},
+        "options": [
+            {"label": "Стандартная дверная ПР", "value": "standard"},
+            {"label": "Без ответной рамки (ПР-БР)", "value": "no_frame"},
+            {"label": "Акустическая (ПР-АКУСТИК)", "value": "acoustic"},
+            {"label": "Не знаю / показать все", "value": "any"},
+        ],
+    },
+    {
         "step_id": "indoor_priority",
         "question": "Что для вас важнее?",
+        "applicable_when_not": {"indoor_type": "transfer"},
         "options": [
             {"label": "Цена (бюджетный вариант)", "value": "budget"},
             {"label": "Дизайн (декоративная)", "value": "design"},
@@ -513,6 +525,7 @@ INDOOR_STEPS: list[dict] = [
     {
         "step_id": "indoor_filling",
         "question": "Необходима ли регулировка потока воздуха?",
+        "applicable_when_not": {"indoor_type": "transfer"},
         "options": [
             {"label": "Нет, без регулировки", "value": "none"},
             {"label": "Да, с лопатками", "value": "louvers"},

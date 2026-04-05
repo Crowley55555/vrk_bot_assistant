@@ -87,6 +87,7 @@ _sessions: dict[str, dict[str, Any]] = defaultdict(lambda: {
     "detail_branch": None,      # "facade" | "indoor" | "slot" | None
     "detail_step_idx": 0,
     "detail_answers": {},       # ответы на шаги детальной ветки
+    "transfer_execution_hint": "",
     "detected_intents": {},     # analog, custom, mechanical_vent, budget, premium
 })
 
@@ -107,6 +108,7 @@ def _reset_funnel(session_id: str) -> None:
     s["detail_branch"] = None
     s["detail_step_idx"] = 0
     s["detail_answers"] = {}
+    s["transfer_execution_hint"] = ""
     s["detected_intents"] = {}
 
 
@@ -304,9 +306,15 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
                 buttons=buttons,
             )
 
-    # ── Routing завершён → к size_group ──
+    # ── Routing завершён → к статическим шагам ──
     session["grille_phase"] = "done"
-    session["step_idx"] = 1  # size_group — steps[1] в grille
+    transfer_only = len(subcats) == 1 and subcats[0] == "reshetki-peretochnye"
+    if transfer_only:
+        # Для переточных решеток в каталоге используется алюминий — шаг material пропускаем.
+        session["active_filters"]["material"] = "aluminum"
+        session["step_idx"] = 2  # size_group
+    else:
+        session["step_idx"] = 1  # material
 
     if len(subcats) == 1:
         label = SUBCATEGORY_RULES.get(subcats[0], {}).get("label", "")
@@ -316,7 +324,7 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
         count = len(subcats)
         prefix += f"Подходящих типов: {count}.\n\n"
 
-    step = _get_scenario(session_id)["steps"][1]
+    step = _get_scenario(session_id)["steps"][session["step_idx"]]
     return ChatResponse(
         reply=prefix + step["question"],
         action=ChatAction.ASK_QUESTION,
@@ -1138,6 +1146,20 @@ def _apply_grille_text_routing(session_id: str, extracted: dict[str, str]) -> No
     session["grille_phase"] = "done" if (mount_hint or feature_hint) else None
 
 
+def _detect_transfer_execution_hint(text: str) -> str:
+    """Пытается определить исполнение переточной решетки из текста."""
+    t = (text or "").lower()
+    if not t:
+        return ""
+    if "акуст" in t:
+        return "acoustic"
+    if "пр-бр" in t or "без ответной рамк" in t or "без рамк" in t:
+        return "no_frame"
+    if "переточ" in t or "двер" in t or "перегород" in t:
+        return "standard"
+    return ""
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # РАСПОЗНАВАНИЕ НАМЕРЕНИЙ (Intent Recognition)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1298,6 +1320,18 @@ def _recommend_series(session_id: str) -> str:
             parts.append(SALES_ARGS["reinforced_recommendation"])
 
     elif branch == "indoor":
+        indoor_type = answers.get("indoor_type", "")
+        transfer_execution = answers.get("transfer_execution", "")
+        if indoor_type == "transfer":
+            transfer_series_map: dict[str, list[str]] = {
+                "standard": ["ПР"],
+                "no_frame": ["ПР-БР"],
+                "acoustic": ["ПР-АКУСТИК"],
+                "any": ["ПР", "ПР-БР", "ПР-АКУСТИК"],
+            }
+            series = transfer_series_map.get(transfer_execution, transfer_series_map["any"])
+            parts.append(f"Рекомендуемые исполнения: {', '.join(series)}")
+            return "\n".join(parts)
         priority = answers.get("indoor_priority", "")
         if priority in INDOOR_SERIES:
             series = INDOOR_SERIES[priority]
@@ -1429,56 +1463,77 @@ async def _detail_search(session_id: str) -> ChatResponse:
     elif s.get("detail_branch") == "indoor":
         answers = s.get("detail_answers") or {}
         indoor_type = (answers.get("indoor_type") or "").strip()
+        transfer_execution = (answers.get("transfer_execution") or "").strip()
         indoor_priority = (answers.get("indoor_priority") or "").strip()
         indoor_filling = (answers.get("indoor_filling") or "").strip()
-
-        current_subcats = s.get("allowed_subcats") or _filter_subcats_by_location("indoor")
-        current_subcats = [
-            slug
-            for slug in current_subcats
-            if "indoor" in SUBCATEGORY_RULES.get(slug, {}).get("location", [])
-        ]
-        narrowed = list(current_subcats)
-
-        type_hints = INDOOR_TYPE_SUBCAT_HINTS.get(indoor_type, [])
-        if type_hints:
-            by_type = [slug for slug in narrowed if slug in type_hints]
-            if by_type:
-                narrowed = by_type
-
-        priority_hints = INDOOR_PRIORITY_SUBCAT_HINTS.get(indoor_priority, [])
-        if priority_hints:
-            by_priority = [slug for slug in narrowed if slug in priority_hints]
-            if by_priority:
-                narrowed = by_priority
-
-        if narrowed:
-            s["allowed_subcats"] = narrowed
-
-        # indoor_filling влияет на метаданный фильтр regulated (где применимо в каталоге).
-        if indoor_filling in ("louvers", "deflector"):
-            s["active_filters"]["regulated"] = "regulated"
-        elif indoor_filling == "none":
-            s["active_filters"]["regulated"] = "fixed"
-        else:
+        if indoor_type == "transfer":
+            s["allowed_subcats"] = ["reshetki-peretochnye"]
+            s["active_filters"]["material"] = "aluminum"
             s["active_filters"].pop("regulated", None)
-
-        for hint in (
-            INDOOR_TYPE_QUERY_HINTS.get(indoor_type, ""),
-            INDOOR_PRIORITY_QUERY_HINTS.get(indoor_priority, ""),
-            INDOOR_FILLING_QUERY_HINTS.get(indoor_filling, ""),
-        ):
+            transfer_query_hints = {
+                "standard": "дверная переточная решетка пр",
+                "no_frame": "переточная решетка пр-бр без ответной рамки",
+                "acoustic": "звукопоглощающая переточная решетка пр-акустик",
+                "any": "переточная решетка пр пр-бр пр-акустик",
+            }
+            indoor_query_additions.append(INDOOR_TYPE_QUERY_HINTS.get("transfer", ""))
+            hint = transfer_query_hints.get(transfer_execution, transfer_query_hints["any"])
             if hint:
                 indoor_query_additions.append(hint)
+            log.info(
+                "indoor transfer mapping: execution=%s | subcats=%s | material=%s",
+                transfer_execution or "any",
+                s.get("allowed_subcats"),
+                s["active_filters"].get("material", ""),
+            )
+        else:
+            current_subcats = s.get("allowed_subcats") or _filter_subcats_by_location("indoor")
+            current_subcats = [
+                slug
+                for slug in current_subcats
+                if "indoor" in SUBCATEGORY_RULES.get(slug, {}).get("location", [])
+            ]
+            narrowed = list(current_subcats)
 
-        log.info(
-            "indoor detail mapping: type=%s | priority=%s | filling=%s | subcats=%s | regulated=%s",
-            indoor_type or "-",
-            indoor_priority or "-",
-            indoor_filling or "-",
-            (s.get("allowed_subcats") or [])[:6],
-            s["active_filters"].get("regulated", ""),
-        )
+            type_hints = INDOOR_TYPE_SUBCAT_HINTS.get(indoor_type, [])
+            if type_hints:
+                by_type = [slug for slug in narrowed if slug in type_hints]
+                if by_type:
+                    narrowed = by_type
+
+            priority_hints = INDOOR_PRIORITY_SUBCAT_HINTS.get(indoor_priority, [])
+            if priority_hints:
+                by_priority = [slug for slug in narrowed if slug in priority_hints]
+                if by_priority:
+                    narrowed = by_priority
+
+            if narrowed:
+                s["allowed_subcats"] = narrowed
+
+            # indoor_filling влияет на метаданный фильтр regulated (где применимо в каталоге).
+            if indoor_filling in ("louvers", "deflector"):
+                s["active_filters"]["regulated"] = "regulated"
+            elif indoor_filling == "none":
+                s["active_filters"]["regulated"] = "fixed"
+            else:
+                s["active_filters"].pop("regulated", None)
+
+            for hint in (
+                INDOOR_TYPE_QUERY_HINTS.get(indoor_type, ""),
+                INDOOR_PRIORITY_QUERY_HINTS.get(indoor_priority, ""),
+                INDOOR_FILLING_QUERY_HINTS.get(indoor_filling, ""),
+            ):
+                if hint:
+                    indoor_query_additions.append(hint)
+
+            log.info(
+                "indoor detail mapping: type=%s | priority=%s | filling=%s | subcats=%s | regulated=%s",
+                indoor_type or "-",
+                indoor_priority or "-",
+                indoor_filling or "-",
+                (s.get("allowed_subcats") or [])[:6],
+                s["active_filters"].get("regulated", ""),
+            )
 
     recommendation = _recommend_series(session_id)
     query = _build_search_query(session_id)
@@ -1564,13 +1619,27 @@ async def _after_main_scenario_completed(session_id: str, user_message: str = ""
                 or transfer_from_routing
                 or transfer_from_filters
             )
+            transfer_exec_hint = ""
+            if transfer_only_indoor:
+                transfer_exec_hint = (
+                    _detect_transfer_execution_hint(user_message or "")
+                    or (session.get("transfer_execution_hint") or "")
+                )
             session["detail_branch"] = "indoor"
             session["detail_step_idx"] = 0
-            session["detail_answers"] = {"indoor_type": "transfer"} if transfer_only_indoor else {}
+            if transfer_only_indoor:
+                session["detail_answers"] = {"indoor_type": "transfer"}
+                if transfer_exec_hint:
+                    session["detail_answers"]["transfer_execution"] = transfer_exec_hint
+                session["transfer_execution_hint"] = ""
+            else:
+                session["detail_answers"] = {}
+                session["transfer_execution_hint"] = ""
             session["funnel_phase"] = "detail"
             if transfer_only_indoor:
                 log.info(
-                    "scenario flow: indoor transfer-only detected | prefill indoor_type=transfer | subcats=%s",
+                    "scenario flow: indoor transfer-only detected | prefill indoor_type=transfer, transfer_execution=%s | subcats=%s",
+                    transfer_exec_hint or "-",
                     subcats_now[:4],
                 )
             log.info("scenario flow: entering detail branch | branch=indoor")
@@ -2101,6 +2170,12 @@ async def process_message(request: ChatRequest) -> ChatResponse:
         if session.get("scenario_key") == "grille":
             if "grille_mount" in extracted or "grille_feature" in extracted:
                 _apply_grille_text_routing(session_id, extracted)
+                narrowed_subcats = session.get("allowed_subcats") or []
+                if narrowed_subcats and all(slug == "reshetki-peretochnye" for slug in narrowed_subcats):
+                    session["active_filters"]["material"] = "aluminum"
+                    transfer_hint = _detect_transfer_execution_hint(message)
+                    if transfer_hint:
+                        session["transfer_execution_hint"] = transfer_hint
             elif "location" in valid_filters:
                 session["allowed_subcats"] = _filter_subcats_by_location(valid_filters["location"])
 
