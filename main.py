@@ -1160,6 +1160,32 @@ def _detect_transfer_execution_hint(text: str) -> str:
     return ""
 
 
+def _transfer_execution_marker(meta: dict) -> str:
+    """Определяет тип исполнения переточной решетки по доступным полям."""
+    blob = " ".join(
+        str(meta.get(k, "") or "")
+        for k in ("name", "article", "url", "raw_attrs_json")
+    ).lower()
+    if "пр-акустик" in blob or "акуст" in blob:
+        return "acoustic"
+    if "пр-бр" in blob or "без ответной рамк" in blob:
+        return "no_frame"
+    return "standard"
+
+
+def _filter_transfer_results_by_execution(results: list[dict], execution: str) -> list[dict]:
+    """Локальный post-filter для переточных решеток по выбранному исполнению."""
+    mode = (execution or "").strip()
+    if mode in ("", "any"):
+        return results
+
+    filtered = [
+        r for r in results
+        if _transfer_execution_marker(r.get("metadata", {}) or {}) == mode
+    ]
+    return filtered
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # РАСПОЗНАВАНИЕ НАМЕРЕНИЙ (Intent Recognition)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1554,6 +1580,25 @@ async def _detail_search(session_id: str) -> ChatResponse:
         query, s["active_filters"], scenario, subcats,
         detail_branch=s.get("detail_branch"),
     )
+    if (
+        s.get("detail_branch") == "indoor"
+        and (s.get("detail_answers") or {}).get("indoor_type") == "transfer"
+    ):
+        transfer_execution = (s.get("detail_answers") or {}).get("transfer_execution", "")
+        if transfer_execution and transfer_execution != "any":
+            before = len(results)
+            results = _filter_transfer_results_by_execution(results, transfer_execution)
+            matched_markers = sorted({
+                _transfer_execution_marker((r.get("metadata", {}) or {}))
+                for r in results
+            })
+            log.info(
+                "indoor transfer execution filter: transfer_execution=%s | before_count=%d | after_count=%d | matched_markers=%s",
+                transfer_execution,
+                before,
+                len(results),
+                matched_markers,
+            )
     context = _build_context(results)
 
     extra_context = ""
