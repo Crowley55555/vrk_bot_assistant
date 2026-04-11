@@ -56,6 +56,25 @@ REINDEX_ON_START = _env_bool("REINDEX_ON_START", True)
 # ─── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
+
+def telegram_bot_api_proxy_config() -> tuple[str | None, str | None]:
+    """
+    URL исходящего proxy для запросов к Telegram Bot API (aiogram AiohttpSession).
+    Приоритет: HTTPS_PROXY → ALL_PROXY → HTTP_PROXY (в каждой паре сначала UPPER, затем lower).
+    Без непустого значения — (None, None), бот работает как без proxy.
+    """
+    pairs = (
+        ("HTTPS_PROXY", "https_proxy"),
+        ("ALL_PROXY", "all_proxy"),
+        ("HTTP_PROXY", "http_proxy"),
+    )
+    for upper, lower in pairs:
+        raw = (os.getenv(upper) or os.getenv(lower) or "").strip()
+        if raw:
+            return raw, upper
+    return None, None
+
+
 # ─── API ───────────────────────────────────────────────────────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 

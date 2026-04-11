@@ -27,6 +27,7 @@ async def _ensure_response(raw):
     return raw
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command
@@ -41,6 +42,7 @@ from config import (
     PRODUCT_TYPE_STEP,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_WELCOME_TEXT,
+    telegram_bot_api_proxy_config,
 )
 from logger import get_logger
 from main import process_message
@@ -298,7 +300,15 @@ async def run_bot() -> None:
     log.info("Telegram-бот: прогрев embedding / Chroma (отдельный процесс от backend) …")
     await asyncio.to_thread(warmup_embedding_and_search)
 
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    proxy_url, proxy_env_name = telegram_bot_api_proxy_config()
+    if proxy_url:
+        log.info(
+            "Telegram Bot API: используется proxy (переменная окружения %s)",
+            proxy_env_name,
+        )
+        bot = Bot(token=TELEGRAM_BOT_TOKEN, session=AiohttpSession(proxy=proxy_url))
+    else:
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
 
