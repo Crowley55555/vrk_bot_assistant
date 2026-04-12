@@ -950,6 +950,36 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
             sk,
         )
 
+    extracted_for_rerank = _extract_filters_from_text(text_probe)
+    if (
+        (session.get("active_filters") or {}).get("product_type") == "diffuser"
+        or extracted_for_rerank.get("product_type") == "diffuser"
+    ):
+        diffuser_answers: dict[str, Any] = {}
+        diffuser_answers.update(
+            {
+                k: v
+                for k, v in ((_get_session(session_id).get("detail_answers") or {}).items())
+                if k.startswith("diffuser_") and v
+            }
+        )
+        diffuser_answers.update(
+            {
+                k: v
+                for k, v in extracted_for_rerank.items()
+                if k.startswith("diffuser_") and v
+            }
+        )
+        diffuser_answers.update(_extract_diffuser_hints(text_probe))
+        results = _canonicalize_exhaust_diffuser_results(
+            results,
+            diffuser_answers,
+            text_probe,
+            scenario,
+            session.get("detail_branch"),
+        )
+        results = _rerank_diffuser_results(results, diffuser_answers, text_probe)
+
     log.info(
         "Поиск | scenario=%s | filters=%s | subcats=%s | results=%d",
         session.get("scenario_key", "?"),
@@ -2096,6 +2126,109 @@ def _diffuser_result_diameters(result: dict[str, Any]) -> set[str]:
     }
 
 
+_DIFFUSER_ROUND_ONLY_FAMILIES = frozenset({"nozzle", "universal", "floor"})
+
+
+def _is_canonical_exhaust_diffuser(result: dict[str, Any]) -> bool:
+    meta = result.get("metadata", {}) or {}
+    blob = _diffuser_blob(meta, result.get("text", ""))
+    name = str(meta.get("name", "") or result.get("name", "") or "").lower()
+    url = str(meta.get("url", "") or "").lower()
+    return (
+        "вытяжной диффузор dvs" in blob
+        or "vytyazhnoy-diffuzor-dvs" in url
+        or ("вытяжной диффузор" in name and re.search(r"\bdvs\b", name) is not None)
+    )
+
+
+def _is_broad_exhaust_diffuser_query(
+    answers: dict[str, Any] | None = None,
+    query_text: str = "",
+) -> bool:
+    answers = answers or {}
+    purpose = str(answers.get("diffuser_purpose", "") or "").strip()
+    diffuser_type = str(answers.get("diffuser_type", "") or "").strip()
+    normalized_query = query_text.lower()
+    exhaust_query = (
+        purpose == "exhaust"
+        or ("диффуз" in normalized_query and "вытяж" in normalized_query)
+    )
+    return exhaust_query and diffuser_type in ("", "unknown")
+
+
+def _canonicalize_exhaust_diffuser_results(
+    results: list[dict],
+    answers: dict[str, Any] | None,
+    query_text: str,
+    scenario: dict[str, Any] | None,
+    detail_branch: str | None = "diffuser",
+) -> list[dict]:
+    if not _is_broad_exhaust_diffuser_query(answers, query_text):
+        return results
+
+    canonical = [result for result in results if _is_canonical_exhaust_diffuser(result)]
+    if canonical:
+        return canonical[:1]
+
+    recovered = _search_with_fallback(
+        "вытяжной диффузор dvs",
+        {"product_type": "diffuser"},
+        scenario,
+        None,
+        n_results=40,
+        detail_branch=detail_branch,
+    )
+    canonical = [result for result in recovered if _is_canonical_exhaust_diffuser(result)]
+    if canonical:
+        return canonical[:1]
+    return results
+
+
+def _rerank_diffuser_results(
+    results: list[dict],
+    answers: dict[str, Any] | None = None,
+    query_text: str = "",
+) -> list[dict]:
+    if not results:
+        return results
+
+    answers = answers or {}
+    diffuser_type = str(answers.get("diffuser_type", "") or "").strip()
+    if not _is_broad_exhaust_diffuser_query(answers, query_text) and diffuser_type not in ("", "unknown", "universal"):
+        return results
+
+    canonical = [result for result in results if _is_canonical_exhaust_diffuser(result)]
+    if not canonical:
+        return results
+
+    if diffuser_type in ("", "unknown"):
+        return canonical
+
+    ranked = list(results)
+    ranked.sort(
+        key=lambda result: (
+            0 if _is_canonical_exhaust_diffuser(result) else 1,
+            0 if _diffuser_result_purpose(result) == "exhaust" else 1,
+        )
+    )
+    return ranked
+
+
+def _diffuser_form_step_needed(
+    answers: dict[str, Any],
+    profile: dict[str, Any],
+) -> bool:
+    diffuser_type = str(answers.get("diffuser_type", "") or "").strip()
+    diffuser_form = str(answers.get("diffuser_form", "") or "").strip()
+    if diffuser_form not in ("", "unknown"):
+        return False
+    if diffuser_type in ("", "unknown"):
+        return False
+    if diffuser_type in _DIFFUSER_ROUND_ONLY_FAMILIES:
+        return False
+    return {"round", "square"}.issubset(set(profile.get("forms") or set()))
+
+
 def _build_diffuser_query(answers: dict[str, Any]) -> str:
     parts = ["диффузор"]
     diffuser_type = (answers.get("diffuser_type") or "").strip()
@@ -2226,6 +2359,8 @@ def _search_diffuser_candidates(
         detail_branch="diffuser",
     )
     filtered = _filter_diffuser_results(results, answers)
+    filtered = _canonicalize_exhaust_diffuser_results(filtered, answers, query, scenario, "diffuser")
+    filtered = _rerank_diffuser_results(filtered, answers, query)
     if not filtered and len(active_filters) > 1:
         relaxed = {"product_type": "diffuser"}
         results = _search_with_fallback(
@@ -2237,6 +2372,8 @@ def _search_diffuser_candidates(
             detail_branch="diffuser",
         )
         filtered = _filter_diffuser_results(results, answers)
+        filtered = _canonicalize_exhaust_diffuser_results(filtered, answers, query, scenario, "diffuser")
+        filtered = _rerank_diffuser_results(filtered, answers, query)
     if diffuser_type == "shadow_hidden" and shadow_mount in ("", "unknown") and len(filtered) <= 3:
         shadow_broad_query = (
             "теневой диффузор скрытого монтажа "
@@ -2260,6 +2397,8 @@ def _search_diffuser_candidates(
                 seen_ids.add(rid)
             merged.append(result)
         filtered = _filter_diffuser_results(merged, answers)
+        filtered = _canonicalize_exhaust_diffuser_results(filtered, answers, query, scenario, "diffuser")
+        filtered = _rerank_diffuser_results(filtered, answers, query)
     return query, active_filters, filtered
 
 
@@ -2323,7 +2462,11 @@ def _next_diffuser_step(session_id: str) -> int | None:
         (answers.get("diffuser_type") or "").strip() == "shadow_hidden"
         and (answers.get("diffuser_shadow_mount") or "").strip() in ("", "unknown")
     )
-    if 0 <= profile["count"] <= 3 and not allow_shadow_followup:
+    allow_form_followup = (
+        "diffuser_form" not in answers
+        and _diffuser_form_step_needed(answers, profile)
+    )
+    if 0 <= profile["count"] <= 3 and not allow_shadow_followup and not allow_form_followup:
         return None
 
     if "diffuser_type" not in answers:
@@ -2346,7 +2489,7 @@ def _next_diffuser_step(session_id: str) -> int | None:
         step_cfg = steps[step_index[step_id]]
         if not _detail_step_applicable(step_cfg, answers):
             continue
-        if step_id == "diffuser_form" and len(profile["forms"]) > 1:
+        if step_id == "diffuser_form" and _diffuser_form_step_needed(answers, profile):
             return step_index[step_id]
         if step_id == "diffuser_diameter" and len(profile["diameters"]) > 1:
             return step_index[step_id]

@@ -28,12 +28,17 @@ from main import (  # noqa: E402
 from models import ChatAction, ChatRequest  # noqa: E402
 
 PROOF_QUERIES = [
-    "диффузор",
     "вытяжной диффузор",
-    "приточно-вытяжной диффузор",
+    "диффузор вытяжной",
     "теневой диффузор",
-    "теневой приточно-вытяжной диффузор",
     "дизайнерский диффузор",
+    "перфорированный диффузор",
+    "вихревой диффузор",
+    "сопловый диффузор",
+    "универсальный диффузор",
+    "напольный диффузор",
+    "круглый дизайнерский диффузор",
+    "квадратный дизайнерский диффузор",
 ]
 
 
@@ -144,6 +149,8 @@ async def _run_single(query: str, index: int) -> dict:
     )
     first_question = asked_questions[0] if asked_questions else ""
     purpose_mentions = sum("для чего нужен диффузор" in question.lower() for question in asked_questions)
+    form_mentions = sum("какая форма нужна" in question.lower() for question in asked_questions)
+    top_result_name = final_names[0] if final_names else ""
 
     return {
         "query": query,
@@ -156,6 +163,7 @@ async def _run_single(query: str, index: int) -> dict:
         "final_action": final_response.action.value,
         "final_result_families": final_families,
         "final_result_names": final_names,
+        "top_result_name": top_result_name,
         "products_count": len(products),
         "was_useless_fallback_shown": "yes" if useless_fallback else "no",
         "grille_intercept": "yes" if grille_intercept else "no",
@@ -164,6 +172,7 @@ async def _run_single(query: str, index: int) -> dict:
         if "для чего нужен диффузор" in first_question.lower()
         else "no",
         "purpose_question_asked_count": purpose_mentions,
+        "was_form_question_shown": "yes" if form_mentions else "no",
     }
 
 
