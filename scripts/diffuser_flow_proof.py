@@ -23,14 +23,16 @@ from main import (  # noqa: E402
     _extract_filters_from_text,
     _get_session,
     _reset_funnel,
+    _search_diffuser_candidates,
     process_message,
 )
 from models import ChatAction, ChatRequest  # noqa: E402
 
 PROOF_CASES = [
-    {"case": "fan_broad", "query": "веерный диффузор", "purpose_choice": "unknown"},
-    {"case": "fan_round", "query": "круглый веерный диффузор", "purpose_choice": "unknown"},
-    {"case": "fan_square", "query": "квадратный веерный диффузор", "purpose_choice": "unknown"},
+    {"case": "fan_button_square", "query": "веерный диффузор", "purpose_choice": "unknown", "form_choice": "square"},
+    {"case": "fan_button_round", "query": "веерный диффузор", "purpose_choice": "unknown", "form_choice": "round"},
+    {"case": "fan_text_square", "query": "квадратный веерный диффузор", "purpose_choice": "unknown"},
+    {"case": "fan_text_round", "query": "круглый веерный диффузор", "purpose_choice": "unknown"},
 ]
 
 
@@ -90,8 +92,8 @@ def _pick_button(
     if "где будет установлен диффузор" in reply_lower:
         return choose([extracted.get("diffuser_install", "")])
     if "какая форма нужна" in reply_lower:
-        if extracted.get("diffuser_type") == "fan" and not extracted.get("diffuser_form"):
-            return choose(["round"])
+        if case.get("form_choice"):
+            return choose([str(case["form_choice"])])
         return choose([extracted.get("diffuser_form", "")])
     if "какой размер подключения нужен" in reply_lower:
         return choose([extracted.get("diffuser_swirl_round_size", "")])
@@ -106,11 +108,46 @@ def _buttons_to_dicts(response) -> list[dict]:
     return [{"label": btn.label, "value": btn.value} for btn in (response.buttons or [])]
 
 
+def _seed_detail_answers(extracted: dict[str, str]) -> dict[str, str]:
+    keys = (
+        "diffuser_purpose",
+        "diffuser_type",
+        "diffuser_shadow_mount",
+        "diffuser_fan_notice",
+        "diffuser_form",
+        "diffuser_swirl_round_size",
+        "diffuser_diameter",
+        "diffuser_adjustable",
+    )
+    return {key: value for key, value in extracted.items() if key in keys and value}
+
+
+def _capture_detail_answer(reply: str, answer: str, answers: dict[str, str]) -> None:
+    reply_lower = reply.lower()
+    if "для чего нужен диффузор" in reply_lower:
+        answers["diffuser_purpose"] = answer
+    elif "какой тип диффузора" in reply_lower:
+        answers["diffuser_type"] = answer
+    elif "для какого типа монтажа нужен диффузор скрытого монтажа" in reply_lower:
+        answers["diffuser_shadow_mount"] = answer
+    elif "диаметры таких диффузоров начинаются от 160 мм" in reply_lower:
+        answers["diffuser_fan_notice"] = answer
+    elif "какая форма нужна" in reply_lower:
+        answers["diffuser_form"] = answer
+    elif "какой размер подключения нужен" in reply_lower:
+        answers["diffuser_swirl_round_size"] = answer
+    elif "какой размер подключения / диаметр нужен" in reply_lower:
+        answers["diffuser_diameter"] = answer
+    elif "нужна ли регулировка" in reply_lower:
+        answers["diffuser_adjustable"] = answer
+
+
 async def _run_single(case: dict, index: int) -> dict:
     query = str(case["query"])
     sid = f"diffuser-proof-{index}"
     _reset_funnel(sid)
     extracted = _combined_extracted(query)
+    derived_answers = _seed_detail_answers(extracted)
 
     asked_questions: list[str] = []
     chosen_answers: list[str] = []
@@ -142,10 +179,16 @@ async def _run_single(case: dict, index: int) -> dict:
         if not answer:
             break
         chosen_answers.append(answer)
+        _capture_detail_answer(response.reply, answer, derived_answers)
         response = await process_message(ChatRequest(message=answer, session_id=sid))
         final_response = response
 
     final_response = response
+    proof_sid = f"{sid}-search"
+    _reset_funnel(proof_sid)
+    proof_session = _get_session(proof_sid)
+    proof_session["scenario_key"] = "diffuser"
+    _, final_filters, proof_results = _search_diffuser_candidates(proof_sid, derived_answers, n_results=25)
     products = final_response.products or []
     final_families = sorted({p.get("category", "") for p in products if p.get("category")})
     final_names = [p.get("name", "") for p in products]
@@ -182,6 +225,9 @@ async def _run_single(case: dict, index: int) -> dict:
         "first_session_snapshot": first_session_snapshot,
         "asked_questions_sequence": asked_questions,
         "chosen_answers": chosen_answers,
+        "final_detail_answers": derived_answers,
+        "final_filters": final_filters,
+        "proof_results_count": len(proof_results),
         "purpose_step_button_labels": purpose_step_button_labels,
         "purpose_step_button_values": purpose_step_button_values,
         "final_action": final_response.action.value,

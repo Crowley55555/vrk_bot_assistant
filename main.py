@@ -695,6 +695,13 @@ def _build_where_filter(
         # «В воздуховод»: по location в метаданных не фильтруем, только по form=cylindrical
         if k == "location" and v == "duct":
             continue
+        if (
+            k == "form"
+            and v == "square"
+            and active_filters.get("product_type") == "diffuser"
+        ):
+            conditions.append({k: {"$in": ["square", "rectangular"]}})
+            continue
         conditions.append({k: {"$eq": v}})
     if allowed_subcats:
         conditions.append({"category": {"$in": allowed_subcats}})
@@ -723,6 +730,10 @@ def _validate_product(meta: dict, active_filters: dict[str, str]) -> bool:
             continue
         # Форма: только товары с выбранной формой в характеристиках
         if key == "form":
+            if value == "square" and active_filters.get("product_type") == "diffuser":
+                if (product_value or "").strip() not in ("square", "rectangular"):
+                    return False
+                continue
             if (product_value or "").strip() != value:
                 return False
             continue
@@ -2448,8 +2459,8 @@ def _search_diffuser_candidates(
     shadow_mount = (answers.get("diffuser_shadow_mount") or "").strip()
     diffuser_form = (answers.get("diffuser_form") or "").strip()
     diffuser_adjustable = (answers.get("diffuser_adjustable") or "").strip()
-    if diffuser_form == "round":
-        active_filters["form"] = "round"
+    if diffuser_form in {"round", "square"}:
+        active_filters["form"] = diffuser_form
     if diffuser_adjustable == "yes":
         active_filters["regulated"] = "regulated"
     elif diffuser_adjustable == "no":
