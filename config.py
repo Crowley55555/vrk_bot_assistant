@@ -570,7 +570,6 @@ INDOOR_STEPS: list[dict] = [
             {"label": "Обычная (жалюзи)", "value": "ordinary"},
             {"label": "Перфорированная", "value": "perforated"},
             {"label": "Сотовая", "value": "honeycomb"},
-            {"label": "Более прочная / стальная (серия 4ПР-С)", "value": "steel_strong"},
             {"label": "Не знаю", "value": "unknown"},
         ],
     },
