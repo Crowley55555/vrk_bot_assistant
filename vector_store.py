@@ -24,6 +24,8 @@ log = get_logger(__name__)
 
 _client: Optional[chromadb.ClientAPI] = None
 _collection: Optional[chromadb.Collection] = None
+_embedding_warmed: bool = False
+_first_post_warmup_search_logged: bool = False
 
 
 def reset_db() -> None:
@@ -69,6 +71,44 @@ def get_collection() -> chromadb.Collection:
             _collection.count(),
         )
     return _collection
+
+
+def warmup_embedding_and_search() -> None:
+    """
+    Прогревает ONNX / default embedding (all-MiniLM-L6-v2) и путь query Chroma.
+
+    Вызывать при старте backend и telegram-bot, чтобы первый пользовательский запрос
+    не блокировался на скачивании модели и не уводил callback Telegram в timeout.
+    """
+    global _embedding_warmed
+    log.info("vector store warmup: started")
+    try:
+        from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+
+        ef = DefaultEmbeddingFunction()
+        ef(["__vrk_embedding_warmup__"])
+        log.info("vector store warmup: default embedding model ready (ONNX path)")
+    except Exception as exc:
+        log.exception("vector store warmup: embedding load failed — %s", exc)
+        return
+
+    col = get_collection()
+    n = col.count()
+    if n > 0:
+        try:
+            col.query(
+                query_texts=["__vrk_chroma_query_warmup__"],
+                n_results=min(1, n),
+            )
+            log.info("vector store warmup: Chroma query path completed | n_docs=%d", n)
+        except Exception as exc:
+            log.exception("vector store warmup: Chroma query failed — %s", exc)
+            return
+    else:
+        log.info("vector store warmup: skip collection query (empty index)")
+
+    _embedding_warmed = True
+    log.info("vector store warmup: completed")
 
 
 # ─── Индексация ────────────────────────────────────────────────────────────────
@@ -156,6 +196,11 @@ def search(
     }
     if where:
         kwargs["where"] = where
+
+    global _first_post_warmup_search_logged
+    if _embedding_warmed and not _first_post_warmup_search_logged and total > 0:
+        log.info("rag search: first query after warmup (no embedding cold start on critical path)")
+        _first_post_warmup_search_logged = True
 
     try:
         results = col.query(**kwargs)

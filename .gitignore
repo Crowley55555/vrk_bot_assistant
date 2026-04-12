@@ -204,5 +204,6 @@ cython_debug/
 
 # Проект ВРК
 chroma_db/
+model_cache/
 data/raw_products.json
 logs/*.log

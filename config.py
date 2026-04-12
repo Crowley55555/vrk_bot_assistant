@@ -23,6 +23,13 @@ STATIC_DIR = BASE_DIR / "static"
 DATA_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
+# Кэш ONNX / HuggingFace для эмбеддингов Chroma — задать до импорта chromadb в других модулях.
+_MODEL_CACHE_ROOT = Path(os.getenv("MODEL_CACHE_ROOT", str(BASE_DIR / ".cache")))
+_MODEL_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("HF_HOME", str(_MODEL_CACHE_ROOT / "huggingface"))
+os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", str(_MODEL_CACHE_ROOT / "sentence_transformers"))
+os.environ.setdefault("XDG_CACHE_HOME", str(_MODEL_CACHE_ROOT))
+
 RAW_PRODUCTS_PATH = DATA_DIR / "raw_products.json"
 
 # ─── Логирование ───────────────────────────────────────────────────────────────
@@ -33,8 +40,40 @@ LOG_FILE = LOGS_DIR / "bot.log"
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", str(BASE_DIR / "chroma_db"))
 CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "vrk_products")
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Старт бэкенда: первичный парсинг и индексация (см. catalog_bootstrap.ensure_catalog_ready)
+BOOTSTRAP_SCRAPER_ON_START = _env_bool("BOOTSTRAP_SCRAPER_ON_START", True)
+FORCE_SCRAPER_ON_START = _env_bool("FORCE_SCRAPER_ON_START", False)
+REINDEX_ON_START = _env_bool("REINDEX_ON_START", True)
+
 # ─── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+
+def telegram_bot_api_proxy_config() -> tuple[str | None, str | None]:
+    """
+    URL исходящего proxy для запросов к Telegram Bot API (aiogram AiohttpSession).
+    Приоритет: HTTPS_PROXY → ALL_PROXY → HTTP_PROXY (в каждой паре сначала UPPER, затем lower).
+    Без непустого значения — (None, None), бот работает как без proxy.
+    """
+    pairs = (
+        ("HTTPS_PROXY", "https_proxy"),
+        ("ALL_PROXY", "all_proxy"),
+        ("HTTP_PROXY", "http_proxy"),
+    )
+    for upper, lower in pairs:
+        raw = (os.getenv(upper) or os.getenv(lower) or "").strip()
+        if raw:
+            return raw, upper
+    return None, None
+
 
 # ─── API ───────────────────────────────────────────────────────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
@@ -264,7 +303,7 @@ GRILLE_MOUNT_OPTIONS: dict[str, list[dict]] = {
         {"label": "На стену (открытый монтаж)", "mounts": ["wall"], "value": "wall_open"},
         {"label": "В потолок (открытый)", "mounts": ["ceiling"], "value": "ceiling_open"},
         {"label": "В потолок / стену (скрытый монтаж)", "mounts": ["ceiling_concealed", "wall_concealed"], "value": "concealed"},
-        {"label": "В перегородку / дверь (переток)", "mounts": ["door", "wall"], "value": "transfer"},
+        {"label": "В перегородку / дверь (переток)", "mounts": ["door"], "value": "transfer"},
         {"label": "В пол", "mounts": ["floor"], "value": "floor"},
     ],
 }
@@ -306,6 +345,18 @@ FACADE_STEPS: list[dict] = [
         ],
     },
     {
+        "step_id": "facade_solution_type",
+        "question": "Какой тип фасадной решётки нужен?",
+        "options": [
+            {"label": "Стандартная фасадная", "value": "standard"},
+            {"label": "Регулируемая", "value": "regulated"},
+            {"label": "Для обслуживания вентканала", "value": "service"},
+            {"label": "Инерционная", "value": "inertial"},
+            {"label": "С высоким КЖС", "value": "high_kzhs"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+    },
+    {
         "step_id": "facade_material",
         "question": "Какой материал решётки нужен?",
         "options": [
@@ -315,6 +366,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Не важно", "value": ""},
         ],
         "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "standard"},
     },
     {
         "step_id": "facade_mount_type",
@@ -328,6 +380,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Накладная (без фланца)", "value": "surface"},
         ],
         "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "standard"},
     },
     {
         "step_id": "facade_size",
@@ -338,16 +391,56 @@ FACADE_STEPS: list[dict] = [
             {"label": "Более 4 м²", "value": "over_4m2"},
         ],
         "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "standard"},
     },
     {
-        "step_id": "facade_construction",
-        "question": "Какой тип конструкции нужен?",
+        "step_id": "facade_mechanical_vent",
+        "question": "У вас принудительная вентиляция?",
         "options": [
-            {"label": "Стандартная конструкция", "value": "standard"},
-            {"label": "Усиленная конструкция рамы", "value": "reinforced_frame"},
-            {"label": "Усиленная рама + ламели", "value": "reinforced_full"},
+            {"label": "Да, есть механическая вентиляция", "value": "yes"},
+            {"label": "Нет, только декоративная функция", "value": "no"},
         ],
         "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "standard", "facade_size": "over_4m2"},
+    },
+    {
+        "step_id": "facade_over4m2_priority",
+        "question": "Что важнее для вас: цена или жесткость конструкции?",
+        "options": [
+            {"label": "Важна цена", "value": "price"},
+            {"label": "Важна жесткость конструкции", "value": "rigidity"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+        "condition": {
+            "facade_solution_type": "standard",
+            "facade_size": "over_4m2",
+            "facade_mechanical_vent": "yes",
+        },
+    },
+    {
+        "step_id": "facade_reinforced_frame",
+        "question": "Нужно усиление рамы?",
+        "options": [
+            {"label": "Да, нужна усиленная рама", "value": "yes"},
+            {"label": "Нет, стандартной рамы достаточно", "value": "no"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "standard", "facade_size": "over_2m2"},
+    },
+    {
+        "step_id": "facade_reinforced_louvers",
+        "question": "Для больших размеров нужно усиление ламелей?",
+        "options": [
+            {"label": "Да, усиление ламелей требуется", "value": "yes"},
+            {"label": "Нет, усиление ламелей не требуется", "value": "no"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+        "condition": {
+            "facade_solution_type": "standard",
+            "facade_size": "over_4m2",
+            "facade_mechanical_vent": "yes",
+            "facade_over4m2_priority": "rigidity",
+        },
     },
     {
         "step_id": "facade_regulated",
@@ -355,21 +448,43 @@ FACADE_STEPS: list[dict] = [
         "options": [
             {"label": "Нет, нерегулируемая", "value": "fixed"},
             {"label": "Да, регулируемая", "value": "regulated"},
-            {"label": "Инерционная (с обратным клапаном)", "value": "inertial"},
         ],
         "applicable_when_not": {"facade_form": "round", "facade_mount_type": "surface"},
+        "condition": {"facade_solution_type": "standard"},
+    },
+    {
+        "step_id": "facade_inertial_fan_context",
+        "question": "Для инерционной решетки: какая производительность вентилятора и на каком расстоянии он установлен?",
+        "options": [
+            {"label": "Вентилятор рядом / высокая производительность", "value": "near_high"},
+            {"label": "Средняя производительность / средняя дистанция", "value": "mid"},
+            {"label": "Вентилятор далеко / нужна консультация", "value": "far_or_unknown"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "inertial"},
+    },
+    {
+        "step_id": "facade_high_kzhs_variant",
+        "question": "Для высокого КЖС нужна стандартная или нестандартная конструкция?",
+        "options": [
+            {"label": "Стандартная конструкция", "value": "standard"},
+            {"label": "Нестандартная конструкция", "value": "custom"},
+        ],
+        "applicable_when_not": {"facade_form": "round"},
+        "condition": {"facade_solution_type": "high_kzhs"},
     },
 ]
 
 FACADE_SERIES: dict[str, list[str]] = {
-    "embedded_standard":        ["ВРН", "ВРН-К", "РН-50"],
-    "embedded_reinforced_frame": ["ВРН-У"],
-    "embedded_reinforced_full":  ["ВРН-С", "ВРЖС"],
-    "surface_standard":          ["ВРН-Н", "НР-100"],
-    "surface_reinforced_frame":  ["ВРН-НУ"],
-    "surface_reinforced_full":   ["ВРН-НС"],
-    "regulated":                 ["ВРН-Р"],
-    "inertial":                  ["ИР", "ИР-Н", "ИР-У", "ИР-НУ"],
+    "standard_under_2m2": ["ВРН", "ВРН-Н"],
+    "standard_over_2m2": ["ВРН-У", "ВРН-НУ", "ВРН-С", "ВРН-НС"],
+    "standard_over_4m2_price": ["ВРН-У", "ВРН-НУ", "ВРН-С", "ВРН-НС"],
+    "standard_over_4m2_rigidity": ["РН-50", "ВРН-К", "НР-100"],
+    "regulated": ["ВРН-Р"],
+    "service": ["ВРЖС"],
+    "inertial": ["ИР", "ИР-Н", "ИР-У", "ИР-НУ"],
+    "high_kzhs_standard": ["РН-40 (КЖС 0.518)", "НР-50 (КЖС 0.534)"],
+    "high_kzhs_custom": ["РН-40 (увеличенный шаг ламелей, КЖС 0.7)"],
 }
 
 # ── Ветка «АКУСТИЧЕСКИЕ РЕШЁТКИ» (отдельный сценарий в категории Вентиляционные решетки) ──
@@ -405,18 +520,86 @@ INDOOR_STEPS: list[dict] = [
         ],
     },
     {
+        "step_id": "ceiling_size_bucket",
+        "question": "Какой типоразмер потолочной решетки нужен?",
+        "condition": {"indoor_type": "ceiling"},
+        "options": [
+            {"label": "600x600 / 595x595 / Armstrong", "value": "armstrong_600"},
+            {"label": "До 1000 мм", "value": "up_to_1000"},
+            {"label": "Более 1000 мм", "value": "over_1000"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "ceiling_material",
+        "question": "Какой материал потолочной решетки нужен?",
+        "condition": {"indoor_type": "ceiling"},
+        "options": [
+            {"label": "Алюминий", "value": "aluminum"},
+            {"label": "Сталь", "value": "galvanized"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "ceiling_valve",
+        "question": "Нужен клапан расхода воздуха (КРВ)?",
+        "condition": {"indoor_type": "ceiling"},
+        "options": [
+            {"label": "Да", "value": "yes"},
+            {"label": "Нет", "value": "no"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "ceiling_air_direction",
+        "question": "Как нужно распределять воздух?",
+        "condition": {"indoor_type": "ceiling"},
+        "options": [
+            {"label": "В одну сторону", "value": "one"},
+            {"label": "В две стороны", "value": "two"},
+            {"label": "В три стороны", "value": "three"},
+            {"label": "Равномерно во все стороны", "value": "four"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "ceiling_face_type",
+        "question": "Какой тип лицевой части предпочтителен?",
+        "condition": {"indoor_type": "ceiling", "ceiling_air_direction": "four"},
+        "options": [
+            {"label": "Обычная (жалюзи)", "value": "ordinary"},
+            {"label": "Перфорированная", "value": "perforated"},
+            {"label": "Сотовая", "value": "honeycomb"},
+            {"label": "Более прочная / стальная (серия 4ПР-С)", "value": "steel_strong"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "transfer_execution",
+        "question": "Какой вариант переточной решетки нужен?",
+        "condition": {"indoor_type": "transfer"},
+        "options": [
+            {"label": "Стандартная дверная ПР", "value": "standard"},
+            {"label": "Без ответной рамки (ПР-БР)", "value": "no_frame"},
+            {"label": "Акустическая (ПР-АКУСТИК)", "value": "acoustic"},
+            {"label": "Не знаю / показать все", "value": "any"},
+        ],
+    },
+    {
         "step_id": "indoor_priority",
         "question": "Что для вас важнее?",
+        "condition": {"indoor_type": ["regular", "floor"]},
         "options": [
             {"label": "Цена (бюджетный вариант)", "value": "budget"},
             {"label": "Дизайн (декоративная)", "value": "design"},
             {"label": "Премиум качество", "value": "premium"},
-            {"label": "Максимальный воздухопоток (высокий КЖС)", "value": "high_kzhs"},
+            {"label": "Максимальный поток воздуха", "value": "high_kzhs"},
         ],
     },
     {
         "step_id": "indoor_filling",
         "question": "Необходима ли регулировка потока воздуха?",
+        "condition": {"indoor_type": ["regular", "floor"]},
         "options": [
             {"label": "Нет, без регулировки", "value": "none"},
             {"label": "Да, с лопатками", "value": "louvers"},
@@ -431,6 +614,51 @@ INDOOR_SERIES: dict[str, list[str]] = {
     "design":    ["DL", "Декоративная ДР-А"],
     "premium":   ["VL"],
     "high_kzhs": ["РН-40 (КЖС 0,518)", "НР-50 (КЖС 0,534)", "РН-40 увеличенный шаг (КЖС 0,7)"],
+}
+
+# Indoor detail mapping: ответы detail-ветки -> подкатегории/подсказки поиска.
+INDOOR_TYPE_SUBCAT_HINTS: dict[str, list[str]] = {
+    "regular": [
+        "ventiliacionnye-resetki",
+        "alyuminievye-dekorativnye-reshetki",
+        "reshetki-potolochnye",
+        "nereguliruemye",
+        "reguliruemye",
+        "sotovye-ventilyacionnye-resetki",
+        "setcatye-ventilyacionnye-resetki",
+        "perforirovannye-ventilyacionnye-resetki",
+    ],
+    "transfer": ["reshetki-peretochnye"],
+    "floor": ["napolnye-ventilyacionnye-resetki"],
+    "ceiling": ["reshetki-potolochnye"],
+}
+
+INDOOR_PRIORITY_SUBCAT_HINTS: dict[str, list[str]] = {
+    "budget": ["ventiliacionnye-resetki", "nereguliruemye"],
+    "design": ["alyuminievye-dekorativnye-reshetki", "perforirovannye-ventilyacionnye-resetki"],
+    "premium": ["alyuminievye-dekorativnye-reshetki"],
+    "high_kzhs": ["sotovye-ventilyacionnye-resetki", "setcatye-ventilyacionnye-resetki"],
+}
+
+INDOOR_TYPE_QUERY_HINTS: dict[str, str] = {
+    "regular": "стеновая потолочная вентиляционная решетка",
+    "transfer": "переточная решетка для двери или перегородки",
+    "floor": "напольная вентиляционная решетка",
+    "ceiling": "потолочная решетка armstrong 600x600 595x595",
+}
+
+INDOOR_PRIORITY_QUERY_HINTS: dict[str, str] = {
+    "budget": "бюджетная серия адл",
+    "design": "декоративная дизайнерская серия dl",
+    "premium": "премиальная серия vl",
+    "high_kzhs": "высокий кжс повышенная пропускная способность",
+}
+
+INDOOR_FILLING_QUERY_HINTS: dict[str, str] = {
+    "none": "нерегулируемая без регулировки",
+    "louvers": "регулируемая с лопатками",
+    "deflector": "с дефлектором",
+    "removable": "со съемным полотном",
 }
 
 # ── Ветка «ЩЕЛЕВЫЕ РЕШЕТКИ» ──────────────────────────────────────────────────
@@ -462,17 +690,90 @@ SLOT_STEPS: list[dict] = [
         ],
     },
     {
+        "step_id": "gkl_drywall_mm",
+        "question": "Какая толщина гипсокартона: 9 или 12 мм?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "9 мм", "value": "9mm"},
+            {"label": "12 мм", "value": "12mm"},
+        ],
+    },
+    {
+        "step_id": "gkl_layers",
+        "question": "Сколько слоёв гипсокартона: один или два?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "Один слой", "value": "1"},
+            {"label": "Два слоя", "value": "2"},
+        ],
+    },
+    {
+        "step_id": "gkl_air_volume",
+        "question": "Какой нужен воздухообмен по ощущениям?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "Небольшой (типичная комната)", "value": "low"},
+            {"label": "Средний", "value": "medium"},
+            {"label": "Сильный / нужна консультация по расчёту", "value": "high"},
+        ],
+    },
+    {
+        "step_id": "gkl_supply_exhaust",
+        "question": "Это подача воздуха или вытяжка?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "Подача", "value": "supply"},
+            {"label": "Вытяжка", "value": "exhaust"},
+        ],
+    },
+    {
+        "step_id": "gkl_slot_layout",
+        "question": "Сколько линий щели нужно: одна, несколько или разветвление (Y)?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "Одна линия", "value": "single"},
+            {"label": "Несколько линий", "value": "multi"},
+            {"label": "Y-образно", "value": "y_shape"},
+        ],
+    },
+    {
+        "step_id": "gkl_regulation",
+        "question": "Как нужно регулировать поток: дефлектор, лопатки, клапан, только выравнивание или переходы под PL?",
+        "condition": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
+        "options": [
+            {"label": "Дефлектор", "value": "deflector"},
+            {"label": "Лопатки", "value": "blades"},
+            {"label": "Клапан", "value": "valve"},
+            {"label": "Только выравнивание потока", "value": "equalizer"},
+            {"label": "Переходы под PL", "value": "pl_bushings"},
+        ],
+    },
+    {
         "step_id": "slot_slots_count",
         "question": "Сколько щелей?",
         "options": [
             {"label": "Одна щель", "value": "single"},
             {"label": "Несколько щелей", "value": "multi"},
         ],
+        "applicable_when_not": {"slot_mount": "concealed", "slot_ceiling_type": "gkl"},
     },
 ]
 
+# Обязательные ответы для скрытой щелевой в ГКЛ перед финальным подбором (детальная ветка slot).
+SLOT_GKL_REQUIRED_KEYS: frozenset[str] = frozenset({
+    "slot_adapter",
+    "gkl_drywall_mm",
+    "gkl_layers",
+    "gkl_air_volume",
+    "gkl_supply_exhaust",
+    "gkl_slot_layout",
+    "gkl_regulation",
+})
+
+
 SLOT_SERIES: dict[str, list[str]] = {
-    "gkl":           ["PV", "TL", "VL-G", "HL", "PL35M", "PL50M"],
+
+    "gkl":           ["PV", "TL", "VL-G", "HL", "PL35M", "PL50M", "VLL-G", "VLLS-G"],
     "plaster":       ["VL-S", "G-LOOK", "G-Line-1", "Airline-1", "Airslot", "SDL"],
     "stretch":       ["VL-F", "VLL-F", "VLLS-F"],
     "visible_frame": ["VLL-S", "G-Line-T", "Airline-T", "G-Line-TS", "Airline-TS", "VLLS-S"],
@@ -539,6 +840,10 @@ INTENT_TRIGGERS: dict[str, list[str]] = {
     "premium": [
         "премиум", "премиальн", "дорог", "лучш", "качеств",
         "шлифован", "дизайн",
+    ],
+    "product_info": [
+        "расскажи про", "расскажите про", "что такое", "что за ", "чем отличается",
+        "опиши ", "описание ", "информация про", "характеристики ",
     ],
 }
 
@@ -812,6 +1117,19 @@ SYSTEM_PROMPT = """### РОЛЬ И КОНТЕКСТ
 
 ### КОНТЕКСТ ИЗ БАЗЫ ЗНАНИЙ
 {context}
+
+### ИНФОРМАЦИОННЫЕ ЗАПРОСЫ О ТОВАРЕ
+Если клиент спрашивает «расскажи про …», «что такое …», «чем отличается …»:
+- Отвечай **только** по фактам из блока «КОНТЕКСТ ИЗ БАЗЫ ЗНАНИЙ». Не добавляй размеры, материалы и характеристики, которых нет в контексте.
+- Кратко (обычно 3–5 предложений): назначение, 1–2 плюса из описания или характеристик, если они есть в контексте.
+- Не копируй сырые таблицы; переформулируй простым языком.
+- Если в контексте нет нужного товара или данных мало — честно скажи об этом и предложи связаться с менеджером (телефон в системе), не выдумывай.
+
+### СРАВНЕНИЕ
+Сравнивай только если в контексте есть оба (или все) сравниваемых объекта. Иначе — укажи, чего не хватает, без фантазии.
+
+### КОМПЛЕКТАЦИЯ И АКСЕССУАРЫ
+Не предлагай аксессуары и совместимость, если их нет в контексте каталога.
 
 ### СТИЛЬ: Деловой, экспертный. Маркированные списки. **Жирным** — названия и цены. Русский язык.
 """

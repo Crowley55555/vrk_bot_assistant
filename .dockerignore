@@ -1,0 +1,27 @@
+# VCS / IDE
+.git
+.gitignore
+.cursor
+.idea
+.vscode
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+.venv
+venv
+.env
+.env.*
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Локальные данные и логи (в рантайме монтируются из compose)
+chroma_db
+logs
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
