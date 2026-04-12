@@ -787,24 +787,23 @@ DIFFUSER_STEPS: list[dict] = [
         ],
     },
     {
+        "step_id": "diffuser_shadow_mount",
+        "question": "Для какого типа монтажа нужен диффузор скрытого монтажа?",
+        "condition": {"diffuser_type": "shadow_hidden"},
+        "options": [
+            {"label": "Для натяжного потолка", "value": "stretch_ceiling"},
+            {"label": "В гипсокартон", "value": "drywall"},
+            {"label": "Под шпаклевку", "value": "plaster"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
         "step_id": "diffuser_purpose",
         "question": "Для чего нужен диффузор?",
         "options": [
             {"label": "Приточный", "value": "supply"},
             {"label": "Вытяжной", "value": "exhaust"},
             {"label": "Приточно-вытяжной", "value": "supply_exhaust"},
-            {"label": "Не знаю", "value": "unknown"},
-        ],
-    },
-    {
-        "step_id": "diffuser_install",
-        "question": "Где будет установлен диффузор?",
-        "condition": {"diffuser_type": "shadow_hidden"},
-        "options": [
-            {"label": "В потолок", "value": "ceiling"},
-            {"label": "В натяжной потолок", "value": "stretch_ceiling"},
-            {"label": "Скрытого монтажа", "value": "hidden"},
-            {"label": "В пол", "value": "floor"},
             {"label": "Не знаю", "value": "unknown"},
         ],
     },

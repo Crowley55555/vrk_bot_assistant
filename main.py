@@ -1341,11 +1341,34 @@ def _diffuser_blob(meta: dict[str, Any], text: str = "") -> str:
     return " ".join(parts).lower()
 
 
+def _diffuser_core_blob(meta: dict[str, Any]) -> str:
+    raw_attrs = _parse_raw_attrs_json(meta)
+    parts = [
+        str(meta.get("name", "") or ""),
+        str(meta.get("article", "") or ""),
+        str(meta.get("url", "") or ""),
+        str(meta.get("category", "") or ""),
+        " ".join(str(v) for v in raw_attrs.values()),
+    ]
+    return " ".join(parts).lower()
+
+
 def _extract_diffuser_diameter(text: str) -> str:
     lower = (text or "").lower()
     for diameter in _DIFFUSER_SUPPORTED_DIAMETERS:
         if re.search(rf"(?<!\d)(?:d|ø|ф)?\s*{diameter}(?:\s*мм)?(?!\d)", lower):
             return diameter
+    return ""
+
+
+def _extract_diffuser_shadow_mount(text: str) -> str:
+    lower = (text or "").lower()
+    if "натяж" in lower:
+        return "stretch_ceiling"
+    if "гипсокарт" in lower or "гкл" in lower:
+        return "drywall"
+    if "шпаклев" in lower:
+        return "plaster"
     return ""
 
 
@@ -1405,6 +1428,10 @@ def _extract_diffuser_hints(text: str) -> dict[str, str]:
         hints["diffuser_install"] = "hidden"
     elif "потолоч" in lower or "в потолок" in lower:
         hints["diffuser_install"] = "ceiling"
+
+    shadow_mount = _extract_diffuser_shadow_mount(lower)
+    if shadow_mount:
+        hints["diffuser_shadow_mount"] = shadow_mount
 
     if "кругл" in lower:
         hints["diffuser_form"] = "round"
@@ -1939,7 +1966,7 @@ async def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
 
 def _diffuser_result_family(result: dict[str, Any]) -> str:
     meta = result.get("metadata", {}) or {}
-    blob = _diffuser_blob(meta, result.get("text", ""))
+    blob = _diffuser_core_blob(meta)
     category = str(meta.get("category", "") or "").lower()
     if category == "napolnye" or "наполь" in blob:
         return "floor"
@@ -1955,7 +1982,29 @@ def _diffuser_result_family(result: dict[str, Any]) -> str:
         return "perforated"
     if category == "dizainerskie" or "дизайнер" in blob or "шумоподав" in blob:
         return "designer"
-    if category == "tenevye-ventilyacionnye-diffuzory" or any(x in blob for x in ("тенев", "скрыт", "натяжн", "гипсокарт", "под шпакл")):
+    if (
+        category == "tenevye-ventilyacionnye-diffuzory"
+        or any(
+            marker in blob
+            for marker in (
+                "теневой диффузор",
+                "скрытый диффузор",
+                "щелевой диффузор для гипсокартона",
+                "lcs-мк",
+                "lcs-mk",
+                "lcs-ксд",
+                "lcs-ksd",
+                "lcd-мк",
+                "lcd-mk",
+                "lcd-ксд",
+                "lcd-ksd",
+                "vlm-f",
+                "vlm-g",
+                "vlm-s",
+                "vl-s",
+            )
+        )
+    ):
         return "shadow_hidden"
     return "unknown"
 
@@ -1984,6 +2033,25 @@ def _diffuser_result_install(result: dict[str, Any]) -> str:
         return "hidden"
     if "в потолок" in raw_blob or "потолоч" in raw_blob:
         return "ceiling"
+    return "unknown"
+
+
+def _diffuser_result_shadow_mount(result: dict[str, Any]) -> str:
+    meta = result.get("metadata", {}) or {}
+    raw_blob = " ".join(str(v) for v in _parse_raw_attrs_json(meta).values()).lower()
+    blob = _diffuser_core_blob(meta)
+    if "натяж" in raw_blob or "натяж" in blob or any(marker in blob for marker in ("lcs-мк", "lcs-mk", "lcs-ксд", "lcs-ksd", "vlm-f")):
+        return "stretch_ceiling"
+    if (
+        "гипсокарт" in raw_blob
+        or "гкл" in raw_blob
+        or "гипсокарт" in blob
+        or "гкл" in blob
+        or any(marker in blob for marker in ("vlm-g", "lcd-мк", "lcd-mk", "lcd-ксд", "lcd-ksd"))
+    ):
+        return "drywall"
+    if "шпаклев" in raw_blob or "шпаклев" in blob or any(marker in blob for marker in ("vlm-s", "vl-s")):
+        return "plaster"
     return "unknown"
 
 
@@ -2020,6 +2088,7 @@ def _diffuser_result_diameters(result: dict[str, Any]) -> set[str]:
 def _build_diffuser_query(answers: dict[str, Any]) -> str:
     parts = ["диффузор"]
     diffuser_type = (answers.get("diffuser_type") or "").strip()
+    shadow_mount = (answers.get("diffuser_shadow_mount") or "").strip()
     purpose = (answers.get("diffuser_purpose") or "").strip()
     install = (answers.get("diffuser_install") or "").strip()
     form = (answers.get("diffuser_form") or "").strip()
@@ -2047,6 +2116,11 @@ def _build_diffuser_query(answers: dict[str, Any]) -> str:
         "hidden": "скрытого монтажа",
         "floor": "в пол",
     }
+    shadow_mount_hints = {
+        "stretch_ceiling": "для натяжного потолка",
+        "drywall": "в гипсокартон",
+        "plaster": "под шпаклевку",
+    }
     form_hints = {
         "round": "круглый",
         "square": "квадратный",
@@ -2056,10 +2130,18 @@ def _build_diffuser_query(answers: dict[str, Any]) -> str:
         "no": "нерегулируемый",
     }
 
+    if diffuser_type == "shadow_hidden" and shadow_mount in ("", "unknown"):
+        parts.extend([
+            "для натяжного потолка",
+            "в гипсокартон",
+            "под шпаклевку",
+        ])
+
     for mapping, key in (
         (type_hints, diffuser_type),
         (purpose_hints, purpose),
         (install_hints, install),
+        (shadow_mount_hints, shadow_mount),
         (form_hints, form),
         (adjustable_hints, adjustable),
     ):
@@ -2073,6 +2155,7 @@ def _build_diffuser_query(answers: dict[str, Any]) -> str:
 
 def _filter_diffuser_results(results: list[dict], answers: dict[str, Any]) -> list[dict]:
     diffuser_type = (answers.get("diffuser_type") or "").strip()
+    shadow_mount = (answers.get("diffuser_shadow_mount") or "").strip()
     purpose = (answers.get("diffuser_purpose") or "").strip()
     install = (answers.get("diffuser_install") or "").strip()
     form = (answers.get("diffuser_form") or "").strip()
@@ -2082,6 +2165,8 @@ def _filter_diffuser_results(results: list[dict], answers: dict[str, Any]) -> li
     filtered = list(results)
     if diffuser_type and diffuser_type != "unknown":
         filtered = [r for r in filtered if _diffuser_result_family(r) == diffuser_type]
+    if diffuser_type == "shadow_hidden" and shadow_mount and shadow_mount != "unknown":
+        filtered = [r for r in filtered if _diffuser_result_shadow_mount(r) == shadow_mount]
     if purpose and purpose != "unknown":
         filtered = [r for r in filtered if _diffuser_result_purpose(r) == purpose]
     if install and install != "unknown":
@@ -2109,6 +2194,8 @@ def _search_diffuser_candidates(
     answers = dict(answers or _get_session(session_id).get("detail_answers") or {})
     scenario = _get_scenario(session_id)
     active_filters: dict[str, str] = {"product_type": "diffuser"}
+    diffuser_type = (answers.get("diffuser_type") or "").strip()
+    shadow_mount = (answers.get("diffuser_shadow_mount") or "").strip()
     diffuser_form = (answers.get("diffuser_form") or "").strip()
     diffuser_adjustable = (answers.get("diffuser_adjustable") or "").strip()
     if diffuser_form == "round":
@@ -2139,11 +2226,35 @@ def _search_diffuser_candidates(
             detail_branch="diffuser",
         )
         filtered = _filter_diffuser_results(results, answers)
+    if diffuser_type == "shadow_hidden" and shadow_mount in ("", "unknown") and len(filtered) <= 3:
+        shadow_broad_query = (
+            "теневой диффузор скрытого монтажа "
+            "для натяжного потолка в гипсокартон под шпаклевку"
+        )
+        shadow_results = _search_with_fallback(
+            shadow_broad_query,
+            {"product_type": "diffuser"},
+            scenario,
+            None,
+            n_results=max(40, n_results),
+            detail_branch="diffuser",
+        )
+        merged: list[dict] = []
+        seen_ids: set[str] = set()
+        for result in list(results) + list(shadow_results):
+            rid = str(result.get("id", "") or "")
+            if rid and rid in seen_ids:
+                continue
+            if rid:
+                seen_ids.add(rid)
+            merged.append(result)
+        filtered = _filter_diffuser_results(merged, answers)
     return query, active_filters, filtered
 
 
 def _diffuser_results_profile(results: list[dict]) -> dict[str, Any]:
     families = {v for v in (_diffuser_result_family(r) for r in results) if v != "unknown"}
+    shadow_mounts = {v for v in (_diffuser_result_shadow_mount(r) for r in results) if v != "unknown"}
     purposes = {v for v in (_diffuser_result_purpose(r) for r in results) if v != "unknown"}
     installs = {v for v in (_diffuser_result_install(r) for r in results) if v != "unknown"}
     forms = {v for v in (_diffuser_result_form(r) for r in results) if v != "unknown"}
@@ -2155,6 +2266,7 @@ def _diffuser_results_profile(results: list[dict]) -> dict[str, Any]:
     return {
         "count": len(results),
         "families": families,
+        "shadow_mounts": shadow_mounts,
         "purposes": purposes,
         "installs": installs,
         "forms": forms,
@@ -2194,13 +2306,24 @@ def _next_diffuser_step(session_id: str) -> int | None:
 
     _, _, results = _search_diffuser_candidates(session_id, answers, n_results=25)
     profile = _diffuser_results_profile(results)
-    if 0 <= profile["count"] <= 3:
-        return None
 
     step_index = {step["step_id"]: i for i, step in enumerate(steps)}
+    if (
+        (answers.get("diffuser_type") or "").strip() == "shadow_hidden"
+        and "diffuser_shadow_mount" not in answers
+    ):
+        return step_index["diffuser_shadow_mount"]
+
+    allow_shadow_followup = (
+        (answers.get("diffuser_type") or "").strip() == "shadow_hidden"
+        and (answers.get("diffuser_shadow_mount") or "").strip() == "unknown"
+    )
+    if 0 <= profile["count"] <= 3 and not allow_shadow_followup:
+        return None
+
     ordered_step_ids = (
+        "diffuser_shadow_mount",
         "diffuser_purpose",
-        "diffuser_install",
         "diffuser_form",
         "diffuser_diameter",
         "diffuser_adjustable",
@@ -2211,9 +2334,9 @@ def _next_diffuser_step(session_id: str) -> int | None:
         step_cfg = steps[step_index[step_id]]
         if not _detail_step_applicable(step_cfg, answers):
             continue
-        if step_id == "diffuser_purpose" and len(profile["purposes"]) > 1:
+        if step_id == "diffuser_shadow_mount" and len(profile["shadow_mounts"]) > 1:
             return step_index[step_id]
-        if step_id == "diffuser_install" and len(profile["installs"]) > 1:
+        if step_id == "diffuser_purpose" and len(profile["purposes"]) > 1:
             return step_index[step_id]
         if step_id == "diffuser_form" and len(profile["forms"]) > 1:
             return step_index[step_id]
