@@ -55,7 +55,7 @@ from config import (
     SYSTEM_PROMPT,
 )
 from catalog_bootstrap import ensure_catalog_ready
-from llm_factory import get_llm
+from llm_factory import get_llm, get_llm_chain
 from logger import get_logger
 from models import ButtonOption, ChatAction, ChatRequest, ChatResponse
 from product_entity_helpers import (
@@ -587,9 +587,85 @@ def _message_content_to_str(content: Any) -> str:
     return str(content).strip()
 
 
+LLM_PROVIDER_TIMEOUT_SECONDS = 15.0
+
+
+async def _cancel_inflight_llm_task(task: asyncio.Task, provider_name: str, reason: str) -> None:
+    if task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        log.warning("LLM failover: provider=%s cancelled (%s)", provider_name, reason)
+    except Exception as exc:
+        log.warning(
+            "LLM failover: provider=%s errored after cancel (%s): %s",
+            provider_name,
+            reason,
+            exc,
+        )
+    else:
+        log.warning(
+            "LLM failover: provider=%s produced a late response after cancel; ignored",
+            provider_name,
+        )
+
+
+async def _invoke_llm_with_failover(
+    session_id: str,
+    messages: list[Any],
+) -> AIMessage:
+    chain = get_llm_chain()
+    provider_names = [name for name, _ in chain]
+    log.info("LLM request %s: available providers=%s", session_id, provider_names)
+    last_error: Exception | None = None
+
+    for idx, (provider_name, llm) in enumerate(chain):
+        if idx == 0:
+            log.info("LLM request %s: primary provider=%s", session_id, provider_name)
+        else:
+            log.warning("LLM request %s: switching to provider=%s", session_id, provider_name)
+
+        task = asyncio.create_task(
+            llm.ainvoke(messages),
+            name=f"llm:{session_id}:{provider_name}",
+        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=LLM_PROVIDER_TIMEOUT_SECONDS,
+            )
+            log.info("LLM request %s: provider=%s completed", session_id, provider_name)
+            return response
+        except asyncio.TimeoutError as exc:
+            last_error = exc
+            log.warning(
+                "LLM request %s: provider=%s timed out after %.1fs",
+                session_id,
+                provider_name,
+                LLM_PROVIDER_TIMEOUT_SECONDS,
+            )
+            await _cancel_inflight_llm_task(task, provider_name, "timeout")
+        except asyncio.CancelledError:
+            await _cancel_inflight_llm_task(task, provider_name, "caller_cancelled")
+            raise
+        except Exception as exc:
+            last_error = exc
+            log.warning(
+                "LLM request %s: provider=%s failed (%s), trying failover",
+                session_id,
+                provider_name,
+                exc.__class__.__name__,
+            )
+            await _cancel_inflight_llm_task(task, provider_name, "provider_error")
+
+    raise RuntimeError("Все доступные LLM-провайдеры завершились ошибкой") from last_error
+
+
 async def _ask_llm(user_message: str, session_id: str, context: str) -> str:
     try:
-        llm = get_llm()
+        get_llm()
     except RuntimeError as exc:
         log.error("LLM недоступен: %s", exc)
         return (
@@ -604,7 +680,7 @@ async def _ask_llm(user_message: str, session_id: str, context: str) -> str:
     history = session["history"][-20:]
     messages = [system_msg] + history + [HumanMessage(content=user_message)]
     try:
-        response: AIMessage = await llm.ainvoke(messages)
+        response = await _invoke_llm_with_failover(session_id, messages)
         answer = _message_content_to_str(response.content)
     except Exception as exc:
         log.error("Ошибка LLM: %s", exc)
