@@ -330,17 +330,6 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
     session["grille_phase"] = "done"
     transfer_only = len(subcats) == 1 and subcats[0] == "reshetki-peretochnye"
     ceiling_only = len(subcats) == 1 and subcats[0] == "reshetki-potolochnye"
-    if transfer_only:
-        # Для переточных решеток в каталоге используется алюминий — шаг material пропускаем.
-        session["active_filters"]["material"] = "aluminum"
-        session["step_idx"] = 2  # size_group
-    elif ceiling_only:
-        # Для потолочной ветки сначала спрашиваем размер, материал уточняется в ceiling-detail.
-        session["active_filters"].pop("material", None)
-        session["step_idx"] = 2  # size_group
-    else:
-        session["step_idx"] = 1  # material
-
     if len(subcats) == 1:
         label = SUBCATEGORY_RULES.get(subcats[0], {}).get("label", "")
         if label:
@@ -348,6 +337,15 @@ def _grille_advance(session_id: str, prefix: str = "") -> ChatResponse:
     elif subcats:
         count = len(subcats)
         prefix += f"Подходящих типов: {count}.\n\n"
+
+    if transfer_only:
+        # Для переточных решеток в каталоге используется алюминий — шаг material пропускаем.
+        session["active_filters"]["material"] = "aluminum"
+        session["step_idx"] = 2  # size_group
+    elif ceiling_only:
+        return _enter_ceiling_detail_flow(session_id, prefix)
+    else:
+        session["step_idx"] = 1  # material
 
     step = _get_scenario(session_id)["steps"][session["step_idx"]]
     return ChatResponse(
@@ -1740,12 +1738,11 @@ def _next_detail_step(session_id: str) -> int | None:
     return None
 
 
-async def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
-    """Задаёт следующий вопрос из детальной ветки или завершает поиском."""
+def _detail_step_response(session_id: str, prefix: str = "") -> ChatResponse:
     s = _get_session(session_id)
     idx = _next_detail_step(session_id)
     if idx is None:
-        return await _detail_search(session_id)
+        raise ValueError("No applicable detail step available")
 
     s["detail_step_idx"] = idx
     s["funnel_phase"] = "detail"
@@ -1767,11 +1764,8 @@ async def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
         idx,
     )
     options = step.get("options", [])
-    # Аккустические решётки: только Алюминий и Оцинкованная сталь (нержавеющей нет в ассортименте)
     if step.get("step_id") == "acoustic_material":
         options = [o for o in options if (o.get("value") or "") in ("aluminum", "galvanized")]
-    answers = s.get("detail_answers", {})
-    # Для накладной решётки шаг регулировки не показывается (applicable_when_not в config)
     buttons = [
         ButtonOption(
             label=opt["label"],
@@ -1789,6 +1783,42 @@ async def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
         action=ChatAction.ASK_QUESTION,
         buttons=buttons,
     )
+
+
+def _prepare_ceiling_detail_flow(session_id: str) -> None:
+    session = _get_session(session_id)
+    ceiling_hints = dict(session.get("ceiling_hints") or {})
+    session["detail_branch"] = "indoor"
+    session["detail_step_idx"] = 0
+    session["detail_answers"] = {"indoor_type": "ceiling"}
+    for key in (
+        "ceiling_size_bucket",
+        "ceiling_material",
+        "ceiling_valve",
+        "ceiling_model",
+        "ceiling_air_direction",
+        "ceiling_face_type",
+    ):
+        if ceiling_hints.get(key):
+            session["detail_answers"][key] = ceiling_hints[key]
+    session["transfer_execution_hint"] = ""
+    session["ceiling_hints"] = {}
+    session["allowed_subcats"] = ["reshetki-potolochnye"]
+    session["active_filters"].pop("material", None)
+    session["funnel_phase"] = "detail"
+
+
+def _enter_ceiling_detail_flow(session_id: str, prefix: str = "") -> ChatResponse:
+    _prepare_ceiling_detail_flow(session_id)
+    return _detail_step_response(session_id, prefix)
+
+
+async def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
+    """Задаёт следующий вопрос из детальной ветки или завершает поиском."""
+    idx = _next_detail_step(session_id)
+    if idx is None:
+        return await _detail_search(session_id)
+    return _detail_step_response(session_id, prefix)
 
 
 def _recommend_series(session_id: str) -> str:
@@ -2411,20 +2441,7 @@ async def _after_main_scenario_completed(session_id: str, user_message: str = ""
                 session["transfer_execution_hint"] = ""
                 session["ceiling_hints"] = {}
             elif ceiling_only_indoor:
-                session["detail_answers"] = {"indoor_type": "ceiling"}
-                for k in (
-                    "ceiling_size_bucket",
-                    "ceiling_material",
-                    "ceiling_valve",
-                    "ceiling_model",
-                    "ceiling_air_direction",
-                    "ceiling_face_type",
-                ):
-                    if ceiling_hints.get(k):
-                        session["detail_answers"][k] = ceiling_hints[k]
-                session["transfer_execution_hint"] = ""
-                session["ceiling_hints"] = {}
-                session["allowed_subcats"] = ["reshetki-potolochnye"]
+                _prepare_ceiling_detail_flow(session_id)
             else:
                 session["detail_answers"] = {}
                 session["transfer_execution_hint"] = ""
@@ -2733,6 +2750,16 @@ async def process_message(request: ChatRequest) -> ChatResponse:
 
         if phase == "detail":
             idx = session["detail_step_idx"]
+            if (
+                idx == 0
+                and session.get("scenario_key") == "grille"
+                and session.get("detail_branch") == "indoor"
+                and (session.get("detail_answers") or {}).get("indoor_type") == "ceiling"
+            ):
+                session["funnel_phase"] = "scenario"
+                session["detail_branch"] = None
+                session["detail_answers"] = {}
+                return _grille_back(session_id)
             if idx > 0:
                 steps = _get_detail_steps(session["detail_branch"])
                 prev_id = steps[idx - 1]["step_id"]
@@ -3031,10 +3058,11 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             if (
                 session.get("scenario_key") == "grille"
                 and (session.get("allowed_subcats") or []) == ["reshetki-potolochnye"]
-                and next_idx == 1
+                and next_idx in (1, 2)
             ):
-                # Ceiling-flow: первым практическим шагом оставляем size_group.
-                next_idx = 2
+                session["step_idx"] = len(steps)
+                session["funnel_phase"] = "scenario"
+                return await _after_main_scenario_completed(session_id, message)
             if session.get("scenario_key") == "grille" and not is_grille_routing_done:
                 if next_idx == 0:
                     pass
