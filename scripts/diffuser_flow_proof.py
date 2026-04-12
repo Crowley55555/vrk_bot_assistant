@@ -23,22 +23,16 @@ from main import (  # noqa: E402
     _extract_filters_from_text,
     _get_session,
     _reset_funnel,
+    _search_diffuser_candidates,
     process_message,
 )
 from models import ChatAction, ChatRequest  # noqa: E402
 
-PROOF_QUERIES = [
-    "вытяжной диффузор",
-    "диффузор вытяжной",
-    "теневой диффузор",
-    "дизайнерский диффузор",
-    "перфорированный диффузор",
-    "вихревой диффузор",
-    "сопловый диффузор",
-    "универсальный диффузор",
-    "напольный диффузор",
-    "круглый дизайнерский диффузор",
-    "квадратный дизайнерский диффузор",
+PROOF_CASES = [
+    {"case": "fan_button_square", "query": "веерный диффузор", "purpose_choice": "unknown", "form_choice": "square"},
+    {"case": "fan_button_round", "query": "веерный диффузор", "purpose_choice": "unknown", "form_choice": "round"},
+    {"case": "fan_text_square", "query": "квадратный веерный диффузор", "purpose_choice": "unknown"},
+    {"case": "fan_text_round", "query": "круглый веерный диффузор", "purpose_choice": "unknown"},
 ]
 
 
@@ -61,7 +55,12 @@ def _combined_extracted(query: str) -> dict[str, str]:
     return extracted
 
 
-def _pick_button(reply: str, buttons: list[dict], extracted: dict[str, str]) -> str | None:
+def _pick_button(
+    reply: str,
+    buttons: list[dict],
+    extracted: dict[str, str],
+    case: dict,
+) -> str | None:
     if not buttons:
         return None
 
@@ -72,24 +71,32 @@ def _pick_button(reply: str, buttons: list[dict], extracted: dict[str, str]) -> 
     def choose(preferred: list[str]) -> str | None:
         for value in preferred:
             if value in by_value:
-                return by_value[value]
+                return value
         if "unknown" in by_value:
-            return by_value["unknown"]
+            return "unknown"
         for value in available_values:
             if value != "unknown":
-                return by_value[value]
-        return buttons[0]["label"]
+                return value
+        return buttons[0]["value"]
 
     if "какой тип диффузора" in reply_lower:
         return choose([extracted.get("diffuser_type", "")])
     if "для какого типа монтажа нужен диффузор скрытого монтажа" in reply_lower:
         return choose([extracted.get("diffuser_shadow_mount", "")])
     if "для чего нужен диффузор" in reply_lower:
+        if case.get("purpose_choice"):
+            return choose([str(case["purpose_choice"])])
         return choose([extracted.get("diffuser_purpose", "")])
+    if "диаметры таких диффузоров начинаются от 160 мм" in reply_lower:
+        return choose(["ack"])
     if "где будет установлен диффузор" in reply_lower:
         return choose([extracted.get("diffuser_install", "")])
     if "какая форма нужна" in reply_lower:
+        if case.get("form_choice"):
+            return choose([str(case["form_choice"])])
         return choose([extracted.get("diffuser_form", "")])
+    if "какой размер подключения нужен" in reply_lower:
+        return choose([extracted.get("diffuser_swirl_round_size", "")])
     if "какой размер подключения" in reply_lower:
         return choose([extracted.get("diffuser_diameter", "")])
     if "нужна ли регулировка" in reply_lower:
@@ -101,13 +108,51 @@ def _buttons_to_dicts(response) -> list[dict]:
     return [{"label": btn.label, "value": btn.value} for btn in (response.buttons or [])]
 
 
-async def _run_single(query: str, index: int) -> dict:
+def _seed_detail_answers(extracted: dict[str, str]) -> dict[str, str]:
+    keys = (
+        "diffuser_purpose",
+        "diffuser_type",
+        "diffuser_shadow_mount",
+        "diffuser_fan_notice",
+        "diffuser_form",
+        "diffuser_swirl_round_size",
+        "diffuser_diameter",
+        "diffuser_adjustable",
+    )
+    return {key: value for key, value in extracted.items() if key in keys and value}
+
+
+def _capture_detail_answer(reply: str, answer: str, answers: dict[str, str]) -> None:
+    reply_lower = reply.lower()
+    if "для чего нужен диффузор" in reply_lower:
+        answers["diffuser_purpose"] = answer
+    elif "какой тип диффузора" in reply_lower:
+        answers["diffuser_type"] = answer
+    elif "для какого типа монтажа нужен диффузор скрытого монтажа" in reply_lower:
+        answers["diffuser_shadow_mount"] = answer
+    elif "диаметры таких диффузоров начинаются от 160 мм" in reply_lower:
+        answers["diffuser_fan_notice"] = answer
+    elif "какая форма нужна" in reply_lower:
+        answers["diffuser_form"] = answer
+    elif "какой размер подключения нужен" in reply_lower:
+        answers["diffuser_swirl_round_size"] = answer
+    elif "какой размер подключения / диаметр нужен" in reply_lower:
+        answers["diffuser_diameter"] = answer
+    elif "нужна ли регулировка" in reply_lower:
+        answers["diffuser_adjustable"] = answer
+
+
+async def _run_single(case: dict, index: int) -> dict:
+    query = str(case["query"])
     sid = f"diffuser-proof-{index}"
     _reset_funnel(sid)
     extracted = _combined_extracted(query)
+    derived_answers = _seed_detail_answers(extracted)
 
     asked_questions: list[str] = []
     chosen_answers: list[str] = []
+    purpose_step_button_labels: list[str] = []
+    purpose_step_button_values: list[str] = []
     first_reply = ""
     first_session_snapshot: dict[str, str] = {}
 
@@ -126,14 +171,24 @@ async def _run_single(query: str, index: int) -> dict:
         if response.action != ChatAction.ASK_QUESTION or not response.buttons:
             break
         asked_questions.append(response.reply)
-        answer = _pick_button(response.reply, _buttons_to_dicts(response), extracted)
+        current_buttons = _buttons_to_dicts(response)
+        if "для чего нужен диффузор" in response.reply.lower() and not purpose_step_button_labels:
+            purpose_step_button_labels = [btn["label"] for btn in current_buttons]
+            purpose_step_button_values = [btn["value"] for btn in current_buttons]
+        answer = _pick_button(response.reply, current_buttons, extracted, case)
         if not answer:
             break
         chosen_answers.append(answer)
+        _capture_detail_answer(response.reply, answer, derived_answers)
         response = await process_message(ChatRequest(message=answer, session_id=sid))
         final_response = response
 
     final_response = response
+    proof_sid = f"{sid}-search"
+    _reset_funnel(proof_sid)
+    proof_session = _get_session(proof_sid)
+    proof_session["scenario_key"] = "diffuser"
+    _, final_filters, proof_results = _search_diffuser_candidates(proof_sid, derived_answers, n_results=25)
     products = final_response.products or []
     final_families = sorted({p.get("category", "") for p in products if p.get("category")})
     final_names = [p.get("name", "") for p in products]
@@ -150,9 +205,19 @@ async def _run_single(query: str, index: int) -> dict:
     first_question = asked_questions[0] if asked_questions else ""
     purpose_mentions = sum("для чего нужен диффузор" in question.lower() for question in asked_questions)
     form_mentions = sum("какая форма нужна" in question.lower() for question in asked_questions)
+    fan_notice_mentions = sum(
+        "диаметры таких диффузоров начинаются от 160 мм" in question.lower()
+        for question in asked_questions
+    )
+    swirl_round_size_mentions = sum("какой размер подключения нужен" in question.lower() for question in asked_questions)
+    generic_diameter_mentions = sum(
+        "какой размер подключения / диаметр нужен" in question.lower()
+        for question in asked_questions
+    )
     top_result_name = final_names[0] if final_names else ""
 
     return {
+        "case": case["case"],
         "query": query,
         "recognized_intent": extracted.get("product_type") or "unknown",
         "extracted_facets": extracted,
@@ -160,6 +225,11 @@ async def _run_single(query: str, index: int) -> dict:
         "first_session_snapshot": first_session_snapshot,
         "asked_questions_sequence": asked_questions,
         "chosen_answers": chosen_answers,
+        "final_detail_answers": derived_answers,
+        "final_filters": final_filters,
+        "proof_results_count": len(proof_results),
+        "purpose_step_button_labels": purpose_step_button_labels,
+        "purpose_step_button_values": purpose_step_button_values,
         "final_action": final_response.action.value,
         "final_result_families": final_families,
         "final_result_names": final_names,
@@ -172,14 +242,18 @@ async def _run_single(query: str, index: int) -> dict:
         if "для чего нужен диффузор" in first_question.lower()
         else "no",
         "purpose_question_asked_count": purpose_mentions,
+        "purpose_step_button_count": len(purpose_step_button_labels),
+        "was_fan_notice_step_shown": "yes" if fan_notice_mentions else "no",
         "was_form_question_shown": "yes" if form_mentions else "no",
+        "was_swirl_round_size_step_shown": "yes" if swirl_round_size_mentions else "no",
+        "was_generic_diameter_step_shown": "yes" if generic_diameter_mentions else "no",
     }
 
 
 async def main() -> None:
     report = []
-    for idx, query in enumerate(PROOF_QUERIES, start=1):
-        report.append(await _run_single(query, idx))
+    for idx, case in enumerate(PROOF_CASES, start=1):
+        report.append(await _run_single(case, idx))
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

@@ -775,10 +775,8 @@ DIFFUSER_STEPS: list[dict] = [
         "step_id": "diffuser_purpose",
         "question": "Для чего нужен диффузор?",
         "options": [
-            {"label": "Приточный", "value": "supply"},
             {"label": "Вытяжной", "value": "exhaust"},
-            {"label": "Приточно-вытяжной", "value": "supply_exhaust"},
-            {"label": "Не знаю", "value": "unknown"},
+            {"label": "Приточно-вытяжной", "value": "unknown"},
         ],
     },
     {
@@ -808,11 +806,29 @@ DIFFUSER_STEPS: list[dict] = [
         ],
     },
     {
+        "step_id": "diffuser_fan_notice",
+        "question": "Диаметры таких диффузоров начинаются от 160 мм",
+        "condition": {"diffuser_type": "fan"},
+        "options": [
+            {"label": "Ясно", "value": "ack"},
+        ],
+    },
+    {
         "step_id": "diffuser_form",
         "question": "Какая форма нужна?",
         "options": [
             {"label": "Круглая", "value": "round"},
             {"label": "Квадратная", "value": "square"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "diffuser_swirl_round_size",
+        "question": "Какой размер подключения нужен?",
+        "condition": {"diffuser_type": "swirl", "diffuser_form": "round"},
+        "options": [
+            {"label": "от 200 мм", "value": "ge_200"},
+            {"label": "от 315 мм", "value": "ge_315"},
             {"label": "Не знаю", "value": "unknown"},
         ],
     },

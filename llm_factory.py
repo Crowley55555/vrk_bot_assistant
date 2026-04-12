@@ -22,6 +22,7 @@ from logger import get_logger
 log = get_logger(__name__)
 
 _cached_llm: Optional[BaseChatModel] = None
+_cached_llm_chain: Optional[list[tuple[str, BaseChatModel]]] = None
 
 
 # ─── Провайдеры ────────────────────────────────────────────────────────────────
@@ -178,21 +179,46 @@ def get_llm() -> BaseChatModel:
     global _cached_llm
     if _cached_llm is not None:
         return _cached_llm
+    chain = get_llm_chain()
+    _cached_llm = chain[0][1]
+    return _cached_llm
 
+
+def get_llm_chain() -> list[tuple[str, BaseChatModel]]:
+    """
+    Возвращает упорядоченную цепочку доступных LLM-провайдеров.
+
+    Провайдер считается доступным, если его можно инициализировать
+    по уже существующим переменным окружения.
+    """
+    global _cached_llm, _cached_llm_chain
+    if _cached_llm_chain is not None:
+        return list(_cached_llm_chain)
+
+    chain: list[tuple[str, BaseChatModel]] = []
     for name, factory in _PROVIDERS:
         log.debug("Проверяю провайдер: %s …", name)
         llm = factory()
         if llm is not None:
-            _cached_llm = llm
-            return llm
+            chain.append((name, llm))
 
-    raise RuntimeError(
-        "Ни один LLM-провайдер не сконфигурирован. "
-        "Заполните .env — см. .env.example."
+    if not chain:
+        raise RuntimeError(
+            "Ни один LLM-провайдер не сконфигурирован. "
+            "Заполните .env — см. .env.example."
+        )
+
+    _cached_llm_chain = chain
+    _cached_llm = chain[0][1]
+    log.info(
+        "LLM: доступны провайдеры: %s",
+        ", ".join(name for name, _ in chain),
     )
+    return list(chain)
 
 
 def reset_llm_cache() -> None:
     """Сбросить кеш (полезно при смене ключей в рантайме)."""
-    global _cached_llm
+    global _cached_llm, _cached_llm_chain
     _cached_llm = None
+    _cached_llm_chain = None

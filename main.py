@@ -55,7 +55,7 @@ from config import (
     SYSTEM_PROMPT,
 )
 from catalog_bootstrap import ensure_catalog_ready
-from llm_factory import get_llm
+from llm_factory import get_llm, get_llm_chain
 from logger import get_logger
 from models import ButtonOption, ChatAction, ChatRequest, ChatResponse
 from product_entity_helpers import (
@@ -587,9 +587,85 @@ def _message_content_to_str(content: Any) -> str:
     return str(content).strip()
 
 
+LLM_PROVIDER_TIMEOUT_SECONDS = 15.0
+
+
+async def _cancel_inflight_llm_task(task: asyncio.Task, provider_name: str, reason: str) -> None:
+    if task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        log.warning("LLM failover: provider=%s cancelled (%s)", provider_name, reason)
+    except Exception as exc:
+        log.warning(
+            "LLM failover: provider=%s errored after cancel (%s): %s",
+            provider_name,
+            reason,
+            exc,
+        )
+    else:
+        log.warning(
+            "LLM failover: provider=%s produced a late response after cancel; ignored",
+            provider_name,
+        )
+
+
+async def _invoke_llm_with_failover(
+    session_id: str,
+    messages: list[Any],
+) -> AIMessage:
+    chain = get_llm_chain()
+    provider_names = [name for name, _ in chain]
+    log.info("LLM request %s: available providers=%s", session_id, provider_names)
+    last_error: Exception | None = None
+
+    for idx, (provider_name, llm) in enumerate(chain):
+        if idx == 0:
+            log.info("LLM request %s: primary provider=%s", session_id, provider_name)
+        else:
+            log.warning("LLM request %s: switching to provider=%s", session_id, provider_name)
+
+        task = asyncio.create_task(
+            llm.ainvoke(messages),
+            name=f"llm:{session_id}:{provider_name}",
+        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=LLM_PROVIDER_TIMEOUT_SECONDS,
+            )
+            log.info("LLM request %s: provider=%s completed", session_id, provider_name)
+            return response
+        except asyncio.TimeoutError as exc:
+            last_error = exc
+            log.warning(
+                "LLM request %s: provider=%s timed out after %.1fs",
+                session_id,
+                provider_name,
+                LLM_PROVIDER_TIMEOUT_SECONDS,
+            )
+            await _cancel_inflight_llm_task(task, provider_name, "timeout")
+        except asyncio.CancelledError:
+            await _cancel_inflight_llm_task(task, provider_name, "caller_cancelled")
+            raise
+        except Exception as exc:
+            last_error = exc
+            log.warning(
+                "LLM request %s: provider=%s failed (%s), trying failover",
+                session_id,
+                provider_name,
+                exc.__class__.__name__,
+            )
+            await _cancel_inflight_llm_task(task, provider_name, "provider_error")
+
+    raise RuntimeError("Все доступные LLM-провайдеры завершились ошибкой") from last_error
+
+
 async def _ask_llm(user_message: str, session_id: str, context: str) -> str:
     try:
-        llm = get_llm()
+        get_llm()
     except RuntimeError as exc:
         log.error("LLM недоступен: %s", exc)
         return (
@@ -604,7 +680,7 @@ async def _ask_llm(user_message: str, session_id: str, context: str) -> str:
     history = session["history"][-20:]
     messages = [system_msg] + history + [HumanMessage(content=user_message)]
     try:
-        response: AIMessage = await llm.ainvoke(messages)
+        response = await _invoke_llm_with_failover(session_id, messages)
         answer = _message_content_to_str(response.content)
     except Exception as exc:
         log.error("Ошибка LLM: %s", exc)
@@ -695,6 +771,13 @@ def _build_where_filter(
         # «В воздуховод»: по location в метаданных не фильтруем, только по form=cylindrical
         if k == "location" and v == "duct":
             continue
+        if (
+            k == "form"
+            and v == "square"
+            and active_filters.get("product_type") == "diffuser"
+        ):
+            conditions.append({k: {"$in": ["square", "rectangular"]}})
+            continue
         conditions.append({k: {"$eq": v}})
     if allowed_subcats:
         conditions.append({"category": {"$in": allowed_subcats}})
@@ -723,6 +806,10 @@ def _validate_product(meta: dict, active_filters: dict[str, str]) -> bool:
             continue
         # Форма: только товары с выбранной формой в характеристиках
         if key == "form":
+            if value == "square" and active_filters.get("product_type") == "diffuser":
+                if (product_value or "").strip() not in ("square", "rectangular"):
+                    return False
+                continue
             if (product_value or "").strip() != value:
                 return False
             continue
@@ -971,6 +1058,13 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
             }
         )
         diffuser_answers.update(_extract_diffuser_hints(text_probe))
+        _, _, diffuser_results = _search_diffuser_candidates(
+            session_id,
+            diffuser_answers,
+            n_results=max(25, n_results),
+        )
+        if diffuser_results:
+            results = diffuser_results
         results = _canonicalize_exhaust_diffuser_results(
             results,
             diffuser_answers,
@@ -1347,6 +1441,12 @@ def _extract_ceiling_hints(text: str) -> dict[str, str]:
 
 
 _DIFFUSER_SUPPORTED_DIAMETERS: tuple[str, ...] = ("80", "100", "125", "150", "160", "200")
+_DIFFUSER_SWIRL_ROUND_DIAMETERS: tuple[str, ...] = (
+    "200", "250", "315", "350", "355", "400", "450", "500", "560", "595", "600", "630", "800",
+)
+_DIFFUSER_ALL_KNOWN_DIAMETERS: tuple[str, ...] = tuple(
+    dict.fromkeys(_DIFFUSER_SUPPORTED_DIAMETERS + _DIFFUSER_SWIRL_ROUND_DIAMETERS)
+)
 
 
 def _parse_raw_attrs_json(meta: dict[str, Any]) -> dict[str, Any]:
@@ -1388,6 +1488,19 @@ def _extract_diffuser_diameter(text: str) -> str:
     for diameter in _DIFFUSER_SUPPORTED_DIAMETERS:
         if re.search(rf"(?<!\d)(?:d|ø|ф)?\s*{diameter}(?:\s*мм)?(?!\d)", lower):
             return diameter
+    return ""
+
+
+def _extract_diffuser_swirl_round_size(text: str) -> str:
+    lower = (text or "").lower()
+    if "вихрев" not in lower:
+        return ""
+    for diameter in ("315", "350", "355", "400", "450", "500", "560", "595", "600", "630", "800"):
+        if re.search(rf"(?<!\d)(?:от\s*)?(?:d|ø|ф)?\s*{diameter}(?:\s*мм)?(?!\d)", lower):
+            return "ge_315"
+    for diameter in ("200", "250"):
+        if re.search(rf"(?<!\d)(?:от\s*)?(?:d|ø|ф)?\s*{diameter}(?:\s*мм)?(?!\d)", lower):
+            return "ge_200"
     return ""
 
 
@@ -1468,8 +1581,12 @@ def _extract_diffuser_hints(text: str) -> dict[str, str]:
     elif "квадрат" in lower or "прямоуголь" in lower:
         hints["diffuser_form"] = "square"
 
+    swirl_round_size = _extract_diffuser_swirl_round_size(lower)
+    if swirl_round_size:
+        hints["diffuser_swirl_round_size"] = swirl_round_size
+
     diameter = _extract_diffuser_diameter(lower)
-    if diameter:
+    if diameter and not swirl_round_size:
         hints["diffuser_diameter"] = diameter
 
     if "нерегулиру" in lower:
@@ -1939,6 +2056,18 @@ def _detail_step_response(session_id: str, prefix: str = "") -> ChatResponse:
     options = step.get("options", [])
     if step.get("step_id") == "acoustic_material":
         options = [o for o in options if (o.get("value") or "") in ("aluminum", "galvanized")]
+    if (
+        s.get("detail_branch") == "diffuser"
+        and step.get("step_id") == "diffuser_form"
+        and ((s.get("detail_answers") or {}).get("diffuser_type") or "").strip() == "fan"
+    ):
+        fan_form_values = ("square", "round")
+        options_by_value = {
+            (o.get("value") or ""): o
+            for o in options
+            if (o.get("value") or "") in fan_form_values
+        }
+        options = [options_by_value[value] for value in fan_form_values if value in options_by_value]
     buttons = [
         ButtonOption(
             label=opt["label"],
@@ -2117,16 +2246,48 @@ def _diffuser_result_adjustable(result: dict[str, Any]) -> str:
 
 
 def _diffuser_result_diameters(result: dict[str, Any]) -> set[str]:
+    return _diffuser_result_all_diameters(result) & set(_DIFFUSER_SUPPORTED_DIAMETERS)
+
+
+def _diffuser_result_all_diameters(result: dict[str, Any]) -> set[str]:
     meta = result.get("metadata", {}) or {}
-    blob = _diffuser_blob(meta, result.get("text", ""))
+    raw_attrs = _parse_raw_attrs_json(meta)
+    blob = " ".join(
+        part
+        for part in (
+            str(meta.get("name", "") or ""),
+            str(meta.get("category", "") or ""),
+            " ".join(str(v) for v in raw_attrs.values()),
+            str(result.get("text", "") or ""),
+        )
+        if part
+    ).lower()
     return {
         diameter
-        for diameter in _DIFFUSER_SUPPORTED_DIAMETERS
+        for diameter in _DIFFUSER_ALL_KNOWN_DIAMETERS
         if re.search(rf"(?<!\d)(?:d|ø|ф)?\s*{diameter}(?:\s*мм)?(?!\d)", blob)
     }
 
 
 _DIFFUSER_ROUND_ONLY_FAMILIES = frozenset({"nozzle", "universal", "floor"})
+
+
+def _diffuser_result_swirl_round_size(result: dict[str, Any]) -> str:
+    if _diffuser_result_family(result) != "swirl" or _diffuser_result_form(result) != "round":
+        return "unknown"
+    meta = result.get("metadata", {}) or {}
+    blob = _diffuser_core_blob(meta)
+    if any(marker in blob for marker in ("вкв-р", "vkv-r", "1дкз", "red-kvd", "рэд-квд", "red-svr", "рэд-svr")):
+        return "ge_315"
+    diameters = sorted(int(d) for d in _diffuser_result_all_diameters(result))
+    if not diameters:
+        return "unknown"
+    min_diameter = diameters[0]
+    if min_diameter >= 315:
+        return "ge_315"
+    if any(d >= 200 for d in diameters):
+        return "ge_200"
+    return "unknown"
 
 
 def _is_canonical_exhaust_diffuser(result: dict[str, Any]) -> bool:
@@ -2224,9 +2385,25 @@ def _diffuser_form_step_needed(
         return False
     if diffuser_type in ("", "unknown"):
         return False
+    if diffuser_type == "fan":
+        return True
     if diffuser_type in _DIFFUSER_ROUND_ONLY_FAMILIES:
         return False
     return {"round", "square"}.issubset(set(profile.get("forms") or set()))
+
+
+def _diffuser_swirl_round_size_step_needed(
+    answers: dict[str, Any],
+    profile: dict[str, Any],
+) -> bool:
+    diffuser_type = str(answers.get("diffuser_type", "") or "").strip()
+    diffuser_form = str(answers.get("diffuser_form", "") or "").strip()
+    swirl_round_size = str(answers.get("diffuser_swirl_round_size", "") or "").strip()
+    if swirl_round_size not in ("", "unknown"):
+        return False
+    if diffuser_type != "swirl" or diffuser_form != "round":
+        return False
+    return {"ge_200", "ge_315"}.issubset(set(profile.get("swirl_round_sizes") or set()))
 
 
 def _build_diffuser_query(answers: dict[str, Any]) -> str:
@@ -2236,6 +2413,7 @@ def _build_diffuser_query(answers: dict[str, Any]) -> str:
     purpose = (answers.get("diffuser_purpose") or "").strip()
     install = (answers.get("diffuser_install") or "").strip()
     form = (answers.get("diffuser_form") or "").strip()
+    swirl_round_size = (answers.get("diffuser_swirl_round_size") or "").strip()
     diameter = (answers.get("diffuser_diameter") or "").strip()
     adjustable = (answers.get("diffuser_adjustable") or "").strip()
 
@@ -2280,6 +2458,11 @@ def _build_diffuser_query(answers: dict[str, Any]) -> str:
             "в гипсокартон",
             "под шпаклевку",
         ])
+    if diffuser_type == "swirl" and form == "round":
+        if swirl_round_size == "ge_315":
+            parts.extend(["315 мм", "350 мм", "355 мм", "400 мм", "500 мм", "600 мм"])
+        elif swirl_round_size == "ge_200":
+            parts.extend(["200 мм", "250 мм", "315 мм", "400 мм", "500 мм"])
 
     for mapping, key in (
         (type_hints, diffuser_type),
@@ -2303,6 +2486,7 @@ def _filter_diffuser_results(results: list[dict], answers: dict[str, Any]) -> li
     purpose = (answers.get("diffuser_purpose") or "").strip()
     install = (answers.get("diffuser_install") or "").strip()
     form = (answers.get("diffuser_form") or "").strip()
+    swirl_round_size = (answers.get("diffuser_swirl_round_size") or "").strip()
     diameter = (answers.get("diffuser_diameter") or "").strip()
     adjustable = (answers.get("diffuser_adjustable") or "").strip()
 
@@ -2323,6 +2507,15 @@ def _filter_diffuser_results(results: list[dict], answers: dict[str, Any]) -> li
         ]
     if form and form != "unknown":
         filtered = [r for r in filtered if _diffuser_result_form(r) == form]
+    if diffuser_type == "swirl" and form == "round" and swirl_round_size and swirl_round_size != "unknown":
+        if swirl_round_size == "ge_315":
+            filtered = [r for r in filtered if _diffuser_result_swirl_round_size(r) == "ge_315"]
+        elif swirl_round_size == "ge_200":
+            filtered = [
+                r
+                for r in filtered
+                if _diffuser_result_swirl_round_size(r) in {"ge_200", "ge_315"}
+            ]
     if diameter and diameter != "unknown":
         filtered = [r for r in filtered if diameter in _diffuser_result_diameters(r)]
     if adjustable and adjustable != "unknown":
@@ -2342,8 +2535,8 @@ def _search_diffuser_candidates(
     shadow_mount = (answers.get("diffuser_shadow_mount") or "").strip()
     diffuser_form = (answers.get("diffuser_form") or "").strip()
     diffuser_adjustable = (answers.get("diffuser_adjustable") or "").strip()
-    if diffuser_form == "round":
-        active_filters["form"] = "round"
+    if diffuser_form in {"round", "square"}:
+        active_filters["form"] = diffuser_form
     if diffuser_adjustable == "yes":
         active_filters["regulated"] = "regulated"
     elif diffuser_adjustable == "no":
@@ -2408,6 +2601,7 @@ def _diffuser_results_profile(results: list[dict]) -> dict[str, Any]:
     purposes = {v for v in (_diffuser_result_purpose(r) for r in results) if v != "unknown"}
     installs = {v for v in (_diffuser_result_install(r) for r in results) if v != "unknown"}
     forms = {v for v in (_diffuser_result_form(r) for r in results) if v != "unknown"}
+    swirl_round_sizes = {v for v in (_diffuser_result_swirl_round_size(r) for r in results) if v != "unknown"}
     adjustable = {v for v in (_diffuser_result_adjustable(r) for r in results) if v != "unknown"}
     diameters: set[str] = set()
     for result in results:
@@ -2420,6 +2614,7 @@ def _diffuser_results_profile(results: list[dict]) -> dict[str, Any]:
         "purposes": purposes,
         "installs": installs,
         "forms": forms,
+        "swirl_round_sizes": swirl_round_sizes,
         "diameters": diameters,
         "adjustable": adjustable,
     }
@@ -2466,7 +2661,21 @@ def _next_diffuser_step(session_id: str) -> int | None:
         "diffuser_form" not in answers
         and _diffuser_form_step_needed(answers, profile)
     )
-    if 0 <= profile["count"] <= 3 and not allow_shadow_followup and not allow_form_followup:
+    allow_fan_notice_followup = (
+        (answers.get("diffuser_type") or "").strip() == "fan"
+        and "diffuser_fan_notice" not in answers
+    )
+    allow_swirl_round_size_followup = (
+        "diffuser_swirl_round_size" not in answers
+        and _diffuser_swirl_round_size_step_needed(answers, profile)
+    )
+    if (
+        0 <= profile["count"] <= 3
+        and not allow_shadow_followup
+        and not allow_fan_notice_followup
+        and not allow_form_followup
+        and not allow_swirl_round_size_followup
+    ):
         return None
 
     if "diffuser_type" not in answers:
@@ -2478,8 +2687,15 @@ def _next_diffuser_step(session_id: str) -> int | None:
     ):
         return step_index["diffuser_shadow_mount"]
 
+    if (
+        (answers.get("diffuser_type") or "").strip() == "fan"
+        and "diffuser_fan_notice" not in answers
+    ):
+        return step_index["diffuser_fan_notice"]
+
     ordered_step_ids = (
         "diffuser_form",
+        "diffuser_swirl_round_size",
         "diffuser_diameter",
         "diffuser_adjustable",
     )
@@ -2491,7 +2707,17 @@ def _next_diffuser_step(session_id: str) -> int | None:
             continue
         if step_id == "diffuser_form" and _diffuser_form_step_needed(answers, profile):
             return step_index[step_id]
-        if step_id == "diffuser_diameter" and len(profile["diameters"]) > 1:
+        if step_id == "diffuser_swirl_round_size" and _diffuser_swirl_round_size_step_needed(answers, profile):
+            return step_index[step_id]
+        if (
+            step_id == "diffuser_diameter"
+            and not (
+                (answers.get("diffuser_type") or "").strip() == "swirl"
+                and (answers.get("diffuser_form") or "").strip() == "round"
+            )
+            and (answers.get("diffuser_type") or "").strip() != "fan"
+            and len(profile["diameters"]) > 1
+        ):
             return step_index[step_id]
         if step_id == "diffuser_adjustable" and len(profile["adjustable"]) > 1:
             return step_index[step_id]
