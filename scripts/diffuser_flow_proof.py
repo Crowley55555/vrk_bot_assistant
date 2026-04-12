@@ -28,17 +28,11 @@ from main import (  # noqa: E402
 from models import ChatAction, ChatRequest  # noqa: E402
 
 PROOF_QUERIES = [
-    "вытяжной диффузор",
-    "диффузор вытяжной",
-    "теневой диффузор",
-    "дизайнерский диффузор",
-    "перфорированный диффузор",
     "вихревой диффузор",
-    "сопловый диффузор",
-    "универсальный диффузор",
-    "напольный диффузор",
-    "круглый дизайнерский диффузор",
-    "квадратный дизайнерский диффузор",
+    "круглый вихревой диффузор",
+    "круглый вихревой диффузор от 200 мм",
+    "круглый вихревой диффузор от 315 мм",
+    "квадратный вихревой диффузор",
 ]
 
 
@@ -89,7 +83,14 @@ def _pick_button(reply: str, buttons: list[dict], extracted: dict[str, str]) -> 
     if "где будет установлен диффузор" in reply_lower:
         return choose([extracted.get("diffuser_install", "")])
     if "какая форма нужна" in reply_lower:
-        return choose([extracted.get("diffuser_form", "")])
+        return choose(
+            [
+                extracted.get("diffuser_form", ""),
+                "round" if extracted.get("diffuser_type", "") == "swirl" else "",
+            ]
+        )
+    if "какой размер подключения нужен" in reply_lower:
+        return choose([extracted.get("diffuser_swirl_round_size", "")])
     if "какой размер подключения" in reply_lower:
         return choose([extracted.get("diffuser_diameter", "")])
     if "нужна ли регулировка" in reply_lower:
@@ -150,6 +151,7 @@ async def _run_single(query: str, index: int) -> dict:
     first_question = asked_questions[0] if asked_questions else ""
     purpose_mentions = sum("для чего нужен диффузор" in question.lower() for question in asked_questions)
     form_mentions = sum("какая форма нужна" in question.lower() for question in asked_questions)
+    swirl_round_size_mentions = sum("какой размер подключения нужен" in question.lower() for question in asked_questions)
     top_result_name = final_names[0] if final_names else ""
 
     return {
@@ -173,6 +175,7 @@ async def _run_single(query: str, index: int) -> dict:
         else "no",
         "purpose_question_asked_count": purpose_mentions,
         "was_form_question_shown": "yes" if form_mentions else "no",
+        "was_swirl_round_size_step_shown": "yes" if swirl_round_size_mentions else "no",
     }
 
 

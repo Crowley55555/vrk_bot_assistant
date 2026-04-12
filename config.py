@@ -817,6 +817,16 @@ DIFFUSER_STEPS: list[dict] = [
         ],
     },
     {
+        "step_id": "diffuser_swirl_round_size",
+        "question": "Какой размер подключения нужен?",
+        "condition": {"diffuser_type": "swirl", "diffuser_form": "round"},
+        "options": [
+            {"label": "от 200 мм", "value": "ge_200"},
+            {"label": "от 315 мм", "value": "ge_315"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
         "step_id": "diffuser_diameter",
         "question": "Какой размер подключения / диаметр нужен?",
         "options": [
