@@ -126,14 +126,57 @@ def _get_scenario(session_id: str) -> dict:
 
 # ─── Навигация ────────────────────────────────────────────────────────────────
 
-def _make_buttons(step_config: dict) -> list[ButtonOption]:
+def _filter_unknown_button_options(options: list[dict]) -> list[dict]:
+    return [opt for opt in options if (opt.get("label") or "").strip() != "Не знаю"]
+
+
+def _build_buttons_from_options(
+    options: list[dict],
+    *,
+    prefer_filter_value: bool = False,
+) -> list[ButtonOption]:
+    filtered_options = _filter_unknown_button_options(options)
     return [
         ButtonOption(
             label=opt["label"],
-            value=opt.get("filter_value") or opt.get("value") or opt["label"],
+            value=(
+                opt.get("filter_value")
+                if prefer_filter_value
+                else None
+            ) or opt.get("value") or opt["label"],
         )
-        for opt in step_config.get("options", [])
+        for opt in filtered_options
     ]
+
+
+def _make_buttons(step_config: dict) -> list[ButtonOption]:
+    return _build_buttons_from_options(
+        step_config.get("options", []),
+        prefer_filter_value=True,
+    )
+
+
+def _detail_step_options(session: dict, step: dict) -> list[dict]:
+    options = list(step.get("options", []))
+    if step.get("step_id") == "acoustic_material":
+        options = [o for o in options if (o.get("value") or "") in ("aluminum", "galvanized")]
+    if (
+        session.get("detail_branch") == "diffuser"
+        and step.get("step_id") == "diffuser_form"
+        and ((session.get("detail_answers") or {}).get("diffuser_type") or "").strip() == "fan"
+    ):
+        fan_form_values = ("square", "round")
+        options_by_value = {
+            (o.get("value") or ""): o
+            for o in options
+            if (o.get("value") or "") in fan_form_values
+        }
+        options = [options_by_value[value] for value in fan_form_values if value in options_by_value]
+    return options
+
+
+def _detail_step_buttons(session: dict, step: dict) -> list[ButtonOption]:
+    return _build_buttons_from_options(_detail_step_options(session, step))
 
 
 def _goto_main_menu(session_id: str) -> ChatResponse:
@@ -2053,28 +2096,7 @@ def _detail_step_response(session_id: str, prefix: str = "") -> ChatResponse:
         step.get("step_id"),
         idx,
     )
-    options = step.get("options", [])
-    if step.get("step_id") == "acoustic_material":
-        options = [o for o in options if (o.get("value") or "") in ("aluminum", "galvanized")]
-    if (
-        s.get("detail_branch") == "diffuser"
-        and step.get("step_id") == "diffuser_form"
-        and ((s.get("detail_answers") or {}).get("diffuser_type") or "").strip() == "fan"
-    ):
-        fan_form_values = ("square", "round")
-        options_by_value = {
-            (o.get("value") or ""): o
-            for o in options
-            if (o.get("value") or "") in fan_form_values
-        }
-        options = [options_by_value[value] for value in fan_form_values if value in options_by_value]
-    buttons = [
-        ButtonOption(
-            label=opt["label"],
-            value=opt.get("value") or opt["label"],
-        )
-        for opt in options
-    ]
+    buttons = _detail_step_buttons(s, step)
 
     hint = step.get("hint", "")
     if hint:
@@ -4138,17 +4160,10 @@ async def process_message(request: ChatRequest) -> ChatResponse:
             if idx is not None:
                 branch_steps = _get_detail_steps(session["detail_branch"])
                 step_cfg = branch_steps[idx]
-                opts = step_cfg.get("options", [])
-                if step_cfg.get("step_id") == "acoustic_material":
-                    opts = [o for o in opts if (o.get("value") or "") in ("aluminum", "galvanized")]
-                buttons = [
-                    ButtonOption(label=o["label"], value=o.get("value") or o["label"])
-                    for o in opts
-                ]
                 return ChatResponse(
                     reply=llm_answer + f"\n\n{step_cfg['question']}",
                     action=ChatAction.ASK_QUESTION,
-                    buttons=buttons,
+                    buttons=_detail_step_buttons(session, step_cfg),
                 )
             step_cfg = PRODUCT_TYPE_STEP
         else:
