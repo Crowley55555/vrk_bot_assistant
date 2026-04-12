@@ -28,12 +28,9 @@ from main import (  # noqa: E402
 from models import ChatAction, ChatRequest  # noqa: E402
 
 PROOF_CASES = [
-    {"case": "button_exhaust", "query": "диффузор", "purpose_choice": "exhaust"},
-    {"case": "button_safe_mixed", "query": "диффузор", "purpose_choice": "unknown"},
-    {"case": "text_exhaust", "query": "вытяжной диффузор"},
-    {"case": "text_supply", "query": "приточный диффузор"},
-    {"case": "text_supply_exhaust", "query": "приточно-вытяжной диффузор"},
-    {"case": "broad_diffuser", "query": "диффузор"},
+    {"case": "fan_broad", "query": "веерный диффузор", "purpose_choice": "unknown"},
+    {"case": "fan_round", "query": "круглый веерный диффузор", "purpose_choice": "unknown"},
+    {"case": "fan_square", "query": "квадратный веерный диффузор", "purpose_choice": "unknown"},
 ]
 
 
@@ -88,9 +85,13 @@ def _pick_button(
         if case.get("purpose_choice"):
             return choose([str(case["purpose_choice"])])
         return choose([extracted.get("diffuser_purpose", "")])
+    if "диаметры таких диффузоров начинаются от 160 мм" in reply_lower:
+        return choose(["ack"])
     if "где будет установлен диффузор" in reply_lower:
         return choose([extracted.get("diffuser_install", "")])
     if "какая форма нужна" in reply_lower:
+        if extracted.get("diffuser_type") == "fan" and not extracted.get("diffuser_form"):
+            return choose(["round"])
         return choose([extracted.get("diffuser_form", "")])
     if "какой размер подключения нужен" in reply_lower:
         return choose([extracted.get("diffuser_swirl_round_size", "")])
@@ -161,7 +162,15 @@ async def _run_single(case: dict, index: int) -> dict:
     first_question = asked_questions[0] if asked_questions else ""
     purpose_mentions = sum("для чего нужен диффузор" in question.lower() for question in asked_questions)
     form_mentions = sum("какая форма нужна" in question.lower() for question in asked_questions)
+    fan_notice_mentions = sum(
+        "диаметры таких диффузоров начинаются от 160 мм" in question.lower()
+        for question in asked_questions
+    )
     swirl_round_size_mentions = sum("какой размер подключения нужен" in question.lower() for question in asked_questions)
+    generic_diameter_mentions = sum(
+        "какой размер подключения / диаметр нужен" in question.lower()
+        for question in asked_questions
+    )
     top_result_name = final_names[0] if final_names else ""
 
     return {
@@ -188,8 +197,10 @@ async def _run_single(case: dict, index: int) -> dict:
         else "no",
         "purpose_question_asked_count": purpose_mentions,
         "purpose_step_button_count": len(purpose_step_button_labels),
+        "was_fan_notice_step_shown": "yes" if fan_notice_mentions else "no",
         "was_form_question_shown": "yes" if form_mentions else "no",
         "was_swirl_round_size_step_shown": "yes" if swirl_round_size_mentions else "no",
+        "was_generic_diameter_step_shown": "yes" if generic_diameter_mentions else "no",
     }
 
 

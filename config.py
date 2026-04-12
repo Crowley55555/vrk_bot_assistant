@@ -806,6 +806,14 @@ DIFFUSER_STEPS: list[dict] = [
         ],
     },
     {
+        "step_id": "diffuser_fan_notice",
+        "question": "Диаметры таких диффузоров начинаются от 160 мм",
+        "condition": {"diffuser_type": "fan"},
+        "options": [
+            {"label": "Ясно", "value": "ack"},
+        ],
+    },
+    {
         "step_id": "diffuser_form",
         "question": "Какая форма нужна?",
         "options": [

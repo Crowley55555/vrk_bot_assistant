@@ -1969,6 +1969,18 @@ def _detail_step_response(session_id: str, prefix: str = "") -> ChatResponse:
     options = step.get("options", [])
     if step.get("step_id") == "acoustic_material":
         options = [o for o in options if (o.get("value") or "") in ("aluminum", "galvanized")]
+    if (
+        s.get("detail_branch") == "diffuser"
+        and step.get("step_id") == "diffuser_form"
+        and ((s.get("detail_answers") or {}).get("diffuser_type") or "").strip() == "fan"
+    ):
+        fan_form_values = ("square", "round")
+        options_by_value = {
+            (o.get("value") or ""): o
+            for o in options
+            if (o.get("value") or "") in fan_form_values
+        }
+        options = [options_by_value[value] for value in fan_form_values if value in options_by_value]
     buttons = [
         ButtonOption(
             label=opt["label"],
@@ -2286,6 +2298,8 @@ def _diffuser_form_step_needed(
         return False
     if diffuser_type in ("", "unknown"):
         return False
+    if diffuser_type == "fan":
+        return True
     if diffuser_type in _DIFFUSER_ROUND_ONLY_FAMILIES:
         return False
     return {"round", "square"}.issubset(set(profile.get("forms") or set()))
@@ -2560,6 +2574,10 @@ def _next_diffuser_step(session_id: str) -> int | None:
         "diffuser_form" not in answers
         and _diffuser_form_step_needed(answers, profile)
     )
+    allow_fan_notice_followup = (
+        (answers.get("diffuser_type") or "").strip() == "fan"
+        and "diffuser_fan_notice" not in answers
+    )
     allow_swirl_round_size_followup = (
         "diffuser_swirl_round_size" not in answers
         and _diffuser_swirl_round_size_step_needed(answers, profile)
@@ -2567,6 +2585,7 @@ def _next_diffuser_step(session_id: str) -> int | None:
     if (
         0 <= profile["count"] <= 3
         and not allow_shadow_followup
+        and not allow_fan_notice_followup
         and not allow_form_followup
         and not allow_swirl_round_size_followup
     ):
@@ -2580,6 +2599,12 @@ def _next_diffuser_step(session_id: str) -> int | None:
         and "diffuser_shadow_mount" not in answers
     ):
         return step_index["diffuser_shadow_mount"]
+
+    if (
+        (answers.get("diffuser_type") or "").strip() == "fan"
+        and "diffuser_fan_notice" not in answers
+    ):
+        return step_index["diffuser_fan_notice"]
 
     ordered_step_ids = (
         "diffuser_form",
@@ -2603,6 +2628,7 @@ def _next_diffuser_step(session_id: str) -> int | None:
                 (answers.get("diffuser_type") or "").strip() == "swirl"
                 and (answers.get("diffuser_form") or "").strip() == "round"
             )
+            and (answers.get("diffuser_type") or "").strip() != "fan"
             and len(profile["diameters"]) > 1
         ):
             return step_index[step_id]
