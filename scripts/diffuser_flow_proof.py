@@ -29,14 +29,11 @@ from models import ChatAction, ChatRequest  # noqa: E402
 
 PROOF_QUERIES = [
     "диффузор",
+    "вытяжной диффузор",
+    "приточно-вытяжной диффузор",
     "теневой диффузор",
-    "теневой диффузор для натяжного потолка",
-    "теневой диффузор в гипсокартон",
-    "теневой диффузор под шпаклевку",
-    "диффузор скрытого монтажа",
-    "круглый диффузор скрытого монтажа",
-    "вихревой диффузор",
-    "дизайнерский шумоподавляющий диффузор",
+    "теневой приточно-вытяжной диффузор",
+    "дизайнерский диффузор",
 ]
 
 
@@ -79,19 +76,7 @@ def _pick_button(reply: str, buttons: list[dict], extracted: dict[str, str]) -> 
         return buttons[0]["label"]
 
     if "какой тип диффузора" in reply_lower:
-        return choose(
-            [
-                extracted.get("diffuser_type", ""),
-                "universal",
-                "shadow_hidden",
-                "designer",
-                "perforated",
-                "swirl",
-                "nozzle",
-                "fan",
-                "floor",
-            ]
-        )
+        return choose([extracted.get("diffuser_type", "")])
     if "для какого типа монтажа нужен диффузор скрытого монтажа" in reply_lower:
         return choose([extracted.get("diffuser_shadow_mount", "")])
     if "для чего нужен диффузор" in reply_lower:
@@ -157,6 +142,8 @@ async def _run_single(query: str, index: int) -> dict:
         or "решетк" in first_reply.lower()
         or "решётк" in first_reply.lower()
     )
+    first_question = asked_questions[0] if asked_questions else ""
+    purpose_mentions = sum("для чего нужен диффузор" in question.lower() for question in asked_questions)
 
     return {
         "query": query,
@@ -172,6 +159,11 @@ async def _run_single(query: str, index: int) -> dict:
         "products_count": len(products),
         "was_useless_fallback_shown": "yes" if useless_fallback else "no",
         "grille_intercept": "yes" if grille_intercept else "no",
+        "first_question": first_question,
+        "purpose_is_first_question": "yes"
+        if "для чего нужен диффузор" in first_question.lower()
+        else "no",
+        "purpose_question_asked_count": purpose_mentions,
     }
 
 

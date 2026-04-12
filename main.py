@@ -2012,7 +2012,18 @@ def _diffuser_result_family(result: dict[str, Any]) -> str:
 def _diffuser_result_purpose(result: dict[str, Any]) -> str:
     meta = result.get("metadata", {}) or {}
     blob = _diffuser_blob(meta, result.get("text", ""))
-    if any(x in blob for x in ("приточно-вытяж", "приточно вытяж", "на приток и вытяж", "подходит для притока и вытяжки", "работает на приток и вытяжку")):
+    if any(
+        x in blob
+        for x in (
+            "приточно-вытяж",
+            "приточно вытяж",
+            "на приток и вытяж",
+            "подходит для притока и вытяжки",
+            "работает на приток и вытяжку",
+            "как для приточных, так и для вытяжных",
+            "для организации приточной и вытяжной вентиляции",
+        )
+    ) or ("приточ" in blob and "вытяж" in blob):
         return "supply_exhaust"
     if "вытяж" in blob:
         return "exhaust"
@@ -2301,29 +2312,30 @@ def _enter_diffuser_detail_flow(
 def _next_diffuser_step(session_id: str) -> int | None:
     steps = _get_detail_steps("diffuser")
     answers = _get_session(session_id).get("detail_answers") or {}
-    if "diffuser_type" not in answers:
-        return 0
+    step_index = {step["step_id"]: i for i, step in enumerate(steps)}
+    if "diffuser_purpose" not in answers:
+        return step_index["diffuser_purpose"]
 
     _, _, results = _search_diffuser_candidates(session_id, answers, n_results=25)
     profile = _diffuser_results_profile(results)
 
-    step_index = {step["step_id"]: i for i, step in enumerate(steps)}
+    allow_shadow_followup = (
+        (answers.get("diffuser_type") or "").strip() == "shadow_hidden"
+        and (answers.get("diffuser_shadow_mount") or "").strip() in ("", "unknown")
+    )
+    if 0 <= profile["count"] <= 3 and not allow_shadow_followup:
+        return None
+
+    if "diffuser_type" not in answers:
+        return step_index["diffuser_type"]
+
     if (
         (answers.get("diffuser_type") or "").strip() == "shadow_hidden"
         and "diffuser_shadow_mount" not in answers
     ):
         return step_index["diffuser_shadow_mount"]
 
-    allow_shadow_followup = (
-        (answers.get("diffuser_type") or "").strip() == "shadow_hidden"
-        and (answers.get("diffuser_shadow_mount") or "").strip() == "unknown"
-    )
-    if 0 <= profile["count"] <= 3 and not allow_shadow_followup:
-        return None
-
     ordered_step_ids = (
-        "diffuser_shadow_mount",
-        "diffuser_purpose",
         "diffuser_form",
         "diffuser_diameter",
         "diffuser_adjustable",
@@ -2334,10 +2346,6 @@ def _next_diffuser_step(session_id: str) -> int | None:
         step_cfg = steps[step_index[step_id]]
         if not _detail_step_applicable(step_cfg, answers):
             continue
-        if step_id == "diffuser_shadow_mount" and len(profile["shadow_mounts"]) > 1:
-            return step_index[step_id]
-        if step_id == "diffuser_purpose" and len(profile["purposes"]) > 1:
-            return step_index[step_id]
         if step_id == "diffuser_form" and len(profile["forms"]) > 1:
             return step_index[step_id]
         if step_id == "diffuser_diameter" and len(profile["diameters"]) > 1:

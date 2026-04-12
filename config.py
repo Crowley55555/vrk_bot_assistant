@@ -772,6 +772,16 @@ SLOT_GKL_REQUIRED_KEYS: frozenset[str] = frozenset({
 
 DIFFUSER_STEPS: list[dict] = [
     {
+        "step_id": "diffuser_purpose",
+        "question": "Для чего нужен диффузор?",
+        "options": [
+            {"label": "Приточный", "value": "supply"},
+            {"label": "Вытяжной", "value": "exhaust"},
+            {"label": "Приточно-вытяжной", "value": "supply_exhaust"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
         "step_id": "diffuser_type",
         "question": "Какой тип диффузора нужен?",
         "options": [
@@ -794,16 +804,6 @@ DIFFUSER_STEPS: list[dict] = [
             {"label": "Для натяжного потолка", "value": "stretch_ceiling"},
             {"label": "В гипсокартон", "value": "drywall"},
             {"label": "Под шпаклевку", "value": "plaster"},
-            {"label": "Не знаю", "value": "unknown"},
-        ],
-    },
-    {
-        "step_id": "diffuser_purpose",
-        "question": "Для чего нужен диффузор?",
-        "options": [
-            {"label": "Приточный", "value": "supply"},
-            {"label": "Вытяжной", "value": "exhaust"},
-            {"label": "Приточно-вытяжной", "value": "supply_exhaust"},
             {"label": "Не знаю", "value": "unknown"},
         ],
     },
