@@ -26,6 +26,7 @@ from config import (
     AC_BASKET_SUBCAT_FILTER,
     ACOUSTIC_STEPS,
     CATEGORY_SLUG_MAP,
+    DIFFUSER_STEPS,
     DISTRIBUTOR_SUBCAT_FILTER,
     VENT_PARTS_SUBCAT_FILTER,
     FACADE_SERIES,
@@ -190,6 +191,9 @@ def _activate_scenario(session_id: str, scenario_key: str) -> ChatResponse:
     else:
         # Диффузоры, корзины, воздухораспределители, детали — фильтр по подкатегориям не нужен
         session["allowed_subcats"] = []
+
+    if effective_key == "diffuser":
+        return _enter_diffuser_detail_flow(session_id)
 
     if not scenario["steps"]:
         return _do_filtered_search_sync(session_id, "")
@@ -973,8 +977,9 @@ async def _do_filtered_search(session_id: str, user_message: str) -> ChatRespons
     products = _product_data_list(results, n=n_products)
     _reset_funnel(session_id)
     if products:
+        scenario_label = MAIN_CATEGORIES.get(session.get("scenario_key") or "", "товары").lower()
         return ChatResponse(
-            reply="Вот решетки которые вам могут подойти:",
+            reply=f"Вот {scenario_label} которые вам могут подойти:",
             action=ChatAction.SHOW_PRODUCT,
             products=products,
         )
@@ -1308,6 +1313,113 @@ def _extract_ceiling_hints(text: str) -> dict[str, str]:
             hints["ceiling_valve"] = "yes"
         else:
             hints["ceiling_model"] = marker
+    return hints
+
+
+_DIFFUSER_SUPPORTED_DIAMETERS: tuple[str, ...] = ("80", "100", "125", "150", "160", "200")
+
+
+def _parse_raw_attrs_json(meta: dict[str, Any]) -> dict[str, Any]:
+    raw_json = meta.get("raw_attrs_json", "{}")
+    try:
+        raw_attrs = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return raw_attrs if isinstance(raw_attrs, dict) else {}
+
+
+def _diffuser_blob(meta: dict[str, Any], text: str = "") -> str:
+    raw_attrs = _parse_raw_attrs_json(meta)
+    parts = [
+        str(meta.get("name", "") or ""),
+        str(meta.get("article", "") or ""),
+        str(meta.get("url", "") or ""),
+        str(meta.get("category", "") or ""),
+        " ".join(str(v) for v in raw_attrs.values()),
+        text,
+    ]
+    return " ".join(parts).lower()
+
+
+def _extract_diffuser_diameter(text: str) -> str:
+    lower = (text or "").lower()
+    for diameter in _DIFFUSER_SUPPORTED_DIAMETERS:
+        if re.search(rf"(?<!\d)(?:d|ø|ф)?\s*{diameter}(?:\s*мм)?(?!\d)", lower):
+            return diameter
+    return ""
+
+
+def _extract_diffuser_hints(text: str) -> dict[str, str]:
+    lower = (text or "").lower()
+    hints: dict[str, str] = {}
+    if any(w in lower for w in ("решетк", "решётк")) and "диффуз" not in lower and "анемостат" not in lower:
+        return hints
+    has_diffuser_marker = (
+        "диффуз" in lower
+        or "анемостат" in lower
+        or any(
+            marker in lower
+            for marker in (
+                "тенев", "скрыт", "натяжн", "гипсокарт", "гкл", "под шпакл",
+                "дизайнер", "шумоподав", "перфор", "с отверст", "универсал",
+                "вихрев", "соплов", "струйн", "веерн", "коническ", "наполь",
+                "dvs", "tff", "tsk", "tso", "pka", "pkan", "pca", "pcan",
+                "lcs", "lcd", "lca", "lkan", "lka", "konika", "fdn", "смк",
+            )
+        )
+    )
+    if not has_diffuser_marker:
+        return hints
+
+    hints["product_type"] = "diffuser"
+
+    if any(x in lower for x in ("приточно-вытяж", "приточно вытяж", "приток и вытяж", "на приток и вытяж")):
+        hints["diffuser_purpose"] = "supply_exhaust"
+    elif "вытяж" in lower:
+        hints["diffuser_purpose"] = "exhaust"
+    elif any(x in lower for x in ("приточ", "приточка")):
+        hints["diffuser_purpose"] = "supply"
+
+    if "наполь" in lower or "в пол" in lower:
+        hints["diffuser_type"] = "floor"
+    elif "соплов" in lower or "струйн" in lower:
+        hints["diffuser_type"] = "nozzle"
+    elif "вихрев" in lower:
+        hints["diffuser_type"] = "swirl"
+    elif "веерн" in lower or "коническ" in lower:
+        hints["diffuser_type"] = "fan"
+    elif "универсал" in lower:
+        hints["diffuser_type"] = "universal"
+    elif "перфор" in lower or "с отверст" in lower:
+        hints["diffuser_type"] = "perforated"
+    elif "дизайнер" in lower or "шумоподав" in lower:
+        hints["diffuser_type"] = "designer"
+    elif any(x in lower for x in ("тенев", "скрыт", "натяжн", "гипсокарт", "гкл", "под шпакл")):
+        hints["diffuser_type"] = "shadow_hidden"
+
+    if "в пол" in lower or "наполь" in lower:
+        hints["diffuser_install"] = "floor"
+    elif "натяж" in lower:
+        hints["diffuser_install"] = "stretch_ceiling"
+    elif any(x in lower for x in ("скрыт", "тенев", "гипсокарт", "гкл", "под шпакл")):
+        hints["diffuser_install"] = "hidden"
+    elif "потолоч" in lower or "в потолок" in lower:
+        hints["diffuser_install"] = "ceiling"
+
+    if "кругл" in lower:
+        hints["diffuser_form"] = "round"
+    elif "квадрат" in lower or "прямоуголь" in lower:
+        hints["diffuser_form"] = "square"
+
+    diameter = _extract_diffuser_diameter(lower)
+    if diameter:
+        hints["diffuser_diameter"] = diameter
+
+    if "нерегулиру" in lower:
+        hints["diffuser_adjustable"] = "no"
+    elif "регулиру" in lower or "регулировк" in lower:
+        hints["diffuser_adjustable"] = "yes"
+
     return hints
 
 
@@ -1697,6 +1809,8 @@ def _get_detail_steps(branch: str) -> list[dict]:
         return FACADE_STEPS
     if branch == "acoustic":
         return ACOUSTIC_STEPS
+    if branch == "diffuser":
+        return DIFFUSER_STEPS
     if branch == "indoor":
         return INDOOR_STEPS
     if branch == "slot":
@@ -1729,6 +1843,8 @@ def _detail_step_applicable(step: dict, answers: dict) -> bool:
 def _next_detail_step(session_id: str) -> int | None:
     """Находит индекс следующего неотвеченного и применимого шага."""
     s = _get_session(session_id)
+    if s.get("detail_branch") == "diffuser":
+        return _next_diffuser_step(session_id)
     steps = _get_detail_steps(s["detail_branch"])
     answers = s["detail_answers"]
     for i in range(s["detail_step_idx"], len(steps)):
@@ -1819,6 +1935,293 @@ async def _detail_ask(session_id: str, prefix: str = "") -> ChatResponse:
     if idx is None:
         return await _detail_search(session_id)
     return _detail_step_response(session_id, prefix)
+
+
+def _diffuser_result_family(result: dict[str, Any]) -> str:
+    meta = result.get("metadata", {}) or {}
+    blob = _diffuser_blob(meta, result.get("text", ""))
+    category = str(meta.get("category", "") or "").lower()
+    if category == "napolnye" or "наполь" in blob:
+        return "floor"
+    if category == "soplovye-diffuzory" or "соплов" in blob or "струйн" in blob:
+        return "nozzle"
+    if category == "vixrevye" or "вихрев" in blob:
+        return "swirl"
+    if category == "veernye" or "веерн" in blob or "коническ" in blob:
+        return "fan"
+    if category == "universalnye" or "универсал" in blob:
+        return "universal"
+    if category == "perforirovannye" or "перфор" in blob or "с отверст" in blob:
+        return "perforated"
+    if category == "dizainerskie" or "дизайнер" in blob or "шумоподав" in blob:
+        return "designer"
+    if category == "tenevye-ventilyacionnye-diffuzory" or any(x in blob for x in ("тенев", "скрыт", "натяжн", "гипсокарт", "под шпакл")):
+        return "shadow_hidden"
+    return "unknown"
+
+
+def _diffuser_result_purpose(result: dict[str, Any]) -> str:
+    meta = result.get("metadata", {}) or {}
+    blob = _diffuser_blob(meta, result.get("text", ""))
+    if any(x in blob for x in ("приточно-вытяж", "приточно вытяж", "на приток и вытяж", "подходит для притока и вытяжки", "работает на приток и вытяжку")):
+        return "supply_exhaust"
+    if "вытяж" in blob:
+        return "exhaust"
+    if "приточ" in blob:
+        return "supply"
+    return "unknown"
+
+
+def _diffuser_result_install(result: dict[str, Any]) -> str:
+    meta = result.get("metadata", {}) or {}
+    raw_blob = " ".join(str(v) for v in _parse_raw_attrs_json(meta).values()).lower()
+    blob = _diffuser_blob(meta, result.get("text", ""))
+    if "в пол" in raw_blob or "наполь" in blob:
+        return "floor"
+    if "натяж" in raw_blob or "натяж" in blob:
+        return "stretch_ceiling"
+    if any(x in raw_blob for x in ("скрыт", "гипсокарт", "под шпакл")) or "тенев" in blob:
+        return "hidden"
+    if "в потолок" in raw_blob or "потолоч" in raw_blob:
+        return "ceiling"
+    return "unknown"
+
+
+def _diffuser_result_form(result: dict[str, Any]) -> str:
+    meta = result.get("metadata", {}) or {}
+    form = str(meta.get("form", "") or "").strip().lower()
+    if form == "round":
+        return "round"
+    if form in ("square", "rectangular"):
+        return "square"
+    return "unknown"
+
+
+def _diffuser_result_adjustable(result: dict[str, Any]) -> str:
+    meta = result.get("metadata", {}) or {}
+    regulated = str(meta.get("regulated", "") or "").strip().lower()
+    if regulated == "regulated":
+        return "yes"
+    if regulated in ("", "fixed"):
+        return "no"
+    return "unknown"
+
+
+def _diffuser_result_diameters(result: dict[str, Any]) -> set[str]:
+    meta = result.get("metadata", {}) or {}
+    blob = _diffuser_blob(meta, result.get("text", ""))
+    return {
+        diameter
+        for diameter in _DIFFUSER_SUPPORTED_DIAMETERS
+        if re.search(rf"(?<!\d)(?:d|ø|ф)?\s*{diameter}(?:\s*мм)?(?!\d)", blob)
+    }
+
+
+def _build_diffuser_query(answers: dict[str, Any]) -> str:
+    parts = ["диффузор"]
+    diffuser_type = (answers.get("diffuser_type") or "").strip()
+    purpose = (answers.get("diffuser_purpose") or "").strip()
+    install = (answers.get("diffuser_install") or "").strip()
+    form = (answers.get("diffuser_form") or "").strip()
+    diameter = (answers.get("diffuser_diameter") or "").strip()
+    adjustable = (answers.get("diffuser_adjustable") or "").strip()
+
+    type_hints = {
+        "shadow_hidden": "теневой скрытого монтажа",
+        "designer": "дизайнерский шумоподавляющий",
+        "perforated": "перфорированный с отверстиями",
+        "universal": "универсальный",
+        "swirl": "вихревой",
+        "nozzle": "сопловый струйный",
+        "fan": "веерный конический",
+        "floor": "напольный",
+    }
+    purpose_hints = {
+        "supply": "приточный",
+        "exhaust": "вытяжной",
+        "supply_exhaust": "приточно-вытяжной",
+    }
+    install_hints = {
+        "ceiling": "в потолок",
+        "stretch_ceiling": "для натяжного потолка",
+        "hidden": "скрытого монтажа",
+        "floor": "в пол",
+    }
+    form_hints = {
+        "round": "круглый",
+        "square": "квадратный",
+    }
+    adjustable_hints = {
+        "yes": "регулируемый",
+        "no": "нерегулируемый",
+    }
+
+    for mapping, key in (
+        (type_hints, diffuser_type),
+        (purpose_hints, purpose),
+        (install_hints, install),
+        (form_hints, form),
+        (adjustable_hints, adjustable),
+    ):
+        hint = mapping.get(key, "")
+        if hint:
+            parts.append(hint)
+    if diameter and diameter != "unknown":
+        parts.append(f"{diameter} мм")
+    return " ".join(parts)
+
+
+def _filter_diffuser_results(results: list[dict], answers: dict[str, Any]) -> list[dict]:
+    diffuser_type = (answers.get("diffuser_type") or "").strip()
+    purpose = (answers.get("diffuser_purpose") or "").strip()
+    install = (answers.get("diffuser_install") or "").strip()
+    form = (answers.get("diffuser_form") or "").strip()
+    diameter = (answers.get("diffuser_diameter") or "").strip()
+    adjustable = (answers.get("diffuser_adjustable") or "").strip()
+
+    filtered = list(results)
+    if diffuser_type and diffuser_type != "unknown":
+        filtered = [r for r in filtered if _diffuser_result_family(r) == diffuser_type]
+    if purpose and purpose != "unknown":
+        filtered = [r for r in filtered if _diffuser_result_purpose(r) == purpose]
+    if install and install != "unknown":
+        filtered = [
+            r for r in filtered
+            if (
+                _diffuser_result_install(r) == install
+                or (install == "hidden" and _diffuser_result_install(r) == "stretch_ceiling")
+            )
+        ]
+    if form and form != "unknown":
+        filtered = [r for r in filtered if _diffuser_result_form(r) == form]
+    if diameter and diameter != "unknown":
+        filtered = [r for r in filtered if diameter in _diffuser_result_diameters(r)]
+    if adjustable and adjustable != "unknown":
+        filtered = [r for r in filtered if _diffuser_result_adjustable(r) == adjustable]
+    return filtered
+
+
+def _search_diffuser_candidates(
+    session_id: str,
+    answers: dict[str, Any] | None = None,
+    n_results: int = 25,
+) -> tuple[str, dict[str, str], list[dict]]:
+    answers = dict(answers or _get_session(session_id).get("detail_answers") or {})
+    scenario = _get_scenario(session_id)
+    active_filters: dict[str, str] = {"product_type": "diffuser"}
+    diffuser_form = (answers.get("diffuser_form") or "").strip()
+    diffuser_adjustable = (answers.get("diffuser_adjustable") or "").strip()
+    if diffuser_form == "round":
+        active_filters["form"] = "round"
+    if diffuser_adjustable == "yes":
+        active_filters["regulated"] = "regulated"
+    elif diffuser_adjustable == "no":
+        active_filters["regulated"] = "fixed"
+
+    query = _build_diffuser_query(answers)
+    results = _search_with_fallback(
+        query,
+        active_filters,
+        scenario,
+        None,
+        n_results=n_results,
+        detail_branch="diffuser",
+    )
+    filtered = _filter_diffuser_results(results, answers)
+    if not filtered and len(active_filters) > 1:
+        relaxed = {"product_type": "diffuser"}
+        results = _search_with_fallback(
+            query,
+            relaxed,
+            scenario,
+            None,
+            n_results=n_results,
+            detail_branch="diffuser",
+        )
+        filtered = _filter_diffuser_results(results, answers)
+    return query, active_filters, filtered
+
+
+def _diffuser_results_profile(results: list[dict]) -> dict[str, Any]:
+    families = {v for v in (_diffuser_result_family(r) for r in results) if v != "unknown"}
+    purposes = {v for v in (_diffuser_result_purpose(r) for r in results) if v != "unknown"}
+    installs = {v for v in (_diffuser_result_install(r) for r in results) if v != "unknown"}
+    forms = {v for v in (_diffuser_result_form(r) for r in results) if v != "unknown"}
+    adjustable = {v for v in (_diffuser_result_adjustable(r) for r in results) if v != "unknown"}
+    diameters: set[str] = set()
+    for result in results:
+        diameters.update(_diffuser_result_diameters(result))
+    diameters &= set(_DIFFUSER_SUPPORTED_DIAMETERS)
+    return {
+        "count": len(results),
+        "families": families,
+        "purposes": purposes,
+        "installs": installs,
+        "forms": forms,
+        "diameters": diameters,
+        "adjustable": adjustable,
+    }
+
+
+def _prepare_diffuser_detail_flow(session_id: str, hints: dict[str, str] | None = None) -> None:
+    session = _get_session(session_id)
+    session["scenario_key"] = "diffuser"
+    session["funnel_phase"] = "detail"
+    session["detail_branch"] = "diffuser"
+    session["detail_step_idx"] = 0
+    session["allowed_subcats"] = []
+    session["active_filters"] = {"product_type": "diffuser"}
+    session["detail_answers"] = {}
+    for key, value in (hints or {}).items():
+        if key.startswith("diffuser_") and value:
+            session["detail_answers"][key] = value
+
+
+def _enter_diffuser_detail_flow(
+    session_id: str,
+    hints: dict[str, str] | None = None,
+    prefix: str = "",
+) -> ChatResponse:
+    _prepare_diffuser_detail_flow(session_id, hints)
+    return _detail_step_response(session_id, prefix)
+
+
+def _next_diffuser_step(session_id: str) -> int | None:
+    steps = _get_detail_steps("diffuser")
+    answers = _get_session(session_id).get("detail_answers") or {}
+    if "diffuser_type" not in answers:
+        return 0
+
+    _, _, results = _search_diffuser_candidates(session_id, answers, n_results=25)
+    profile = _diffuser_results_profile(results)
+    if 0 <= profile["count"] <= 3:
+        return None
+
+    step_index = {step["step_id"]: i for i, step in enumerate(steps)}
+    ordered_step_ids = (
+        "diffuser_purpose",
+        "diffuser_install",
+        "diffuser_form",
+        "diffuser_diameter",
+        "diffuser_adjustable",
+    )
+    for step_id in ordered_step_ids:
+        if step_id in answers:
+            continue
+        step_cfg = steps[step_index[step_id]]
+        if not _detail_step_applicable(step_cfg, answers):
+            continue
+        if step_id == "diffuser_purpose" and len(profile["purposes"]) > 1:
+            return step_index[step_id]
+        if step_id == "diffuser_install" and len(profile["installs"]) > 1:
+            return step_index[step_id]
+        if step_id == "diffuser_form" and len(profile["forms"]) > 1:
+            return step_index[step_id]
+        if step_id == "diffuser_diameter" and len(profile["diameters"]) > 1:
+            return step_index[step_id]
+        if step_id == "diffuser_adjustable" and len(profile["adjustable"]) > 1:
+            return step_index[step_id]
+    return None
 
 
 def _recommend_series(session_id: str) -> str:
@@ -1928,6 +2331,36 @@ async def _detail_search(session_id: str) -> ChatResponse:
         s.get("detail_branch"),
         list((s.get("detail_answers") or {}).keys()),
     )
+    if s.get("detail_branch") == "diffuser":
+        answers = s.get("detail_answers") or {}
+        query, active_filters, results = _search_diffuser_candidates(session_id, answers, n_results=25)
+        s["active_filters"] = dict(active_filters)
+        families = sorted({_diffuser_result_family(r) for r in results if _diffuser_result_family(r) != "unknown"})
+        log.info(
+            "diffuser detail mapping: answers=%s | filters=%s | results=%d | families=%s",
+            answers,
+            s["active_filters"],
+            len(results),
+            families,
+        )
+        context = _build_context(results)
+        await _ask_llm(
+            f"Клиент ищет: {query}. Подбери подходящие диффузоры из контекста.",
+            session_id,
+            context,
+        )
+        products = _product_data_list(results, n=5)
+        _reset_funnel(session_id)
+        if products:
+            return ChatResponse(
+                reply="Вот диффузоры которые вам могут подойти:",
+                action=ChatAction.SHOW_PRODUCT,
+                products=products,
+            )
+        return ChatResponse(
+            reply="Под заданные параметры диффузоров товары не найдены. Рекомендую связаться с менеджером для индивидуального подбора.",
+            action=ChatAction.CONTACT_MANAGER,
+        )
     # Подставляем в active_filters ответы из детальной ветки, используемые в метаданных ChromaDB
     if s.get("detail_branch") == "facade":
         answers = s.get("detail_answers") or {}
@@ -2498,6 +2931,21 @@ async def _after_main_scenario_completed(session_id: str, user_message: str = ""
         )
         return await _detail_ask(session_id)
 
+    if sk == "diffuser":
+        diffuser_hints = _extract_diffuser_hints(user_message or "")
+        entities = extract_product_entities(user_message or "")
+        if user_message and is_specific_product_query(user_message, entities):
+            log.info("scenario flow: diffuser model-specific query → direct search")
+            return await _do_filtered_search(session_id, user_message)
+        _prepare_diffuser_detail_flow(session_id, diffuser_hints)
+        log.info(
+            "scenario flow: entering detail branch | branch=diffuser | prefill=%s",
+            {k: v for k, v in diffuser_hints.items() if k.startswith("diffuser_")},
+        )
+        if _next_detail_step(session_id) is None:
+            return await _detail_search(session_id)
+        return _detail_step_response(session_id)
+
     log.info(
         "scenario flow: starting direct search | scenario_key=%s (no detail branch for this scenario)",
         sk,
@@ -2760,6 +3208,17 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                 session["detail_branch"] = None
                 session["detail_answers"] = {}
                 return _grille_back(session_id)
+            if idx == 0 and session.get("detail_branch") == "diffuser":
+                session["active_filters"].clear()
+                session["detail_branch"] = None
+                session["detail_answers"] = {}
+                session["scenario_key"] = None
+                session["funnel_phase"] = "product_type"
+                return ChatResponse(
+                    reply=PRODUCT_TYPE_STEP["question"],
+                    action=ChatAction.ASK_QUESTION,
+                    buttons=_make_buttons(PRODUCT_TYPE_STEP),
+                )
             if idx > 0:
                 steps = _get_detail_steps(session["detail_branch"])
                 prev_id = steps[idx - 1]["step_id"]
@@ -2961,6 +3420,12 @@ async def process_message(request: ChatRequest) -> ChatResponse:
 
     # ── Умный анализ свободного текста ──
     extracted = _extract_filters_from_text(message)
+    diffuser_hints = _extract_diffuser_hints(message)
+    if diffuser_hints:
+        extracted.update({k: v for k, v in diffuser_hints.items() if v})
+        if extracted.get("product_type") == "diffuser":
+            extracted.pop("grille_mount", None)
+            extracted.pop("grille_feature", None)
 
     if extracted:
         pt = extracted.get("product_type") or session.get("scenario_key")
@@ -2968,7 +3433,11 @@ async def process_message(request: ChatRequest) -> ChatResponse:
         scenario = FUNNEL_SCENARIOS.get(scenario_key, FUNNEL_SCENARIOS["_default"])
 
         valid_filters, warnings = _validate_extracted(extracted, scenario, message)
-        if _has_ceiling_intent(message) and not _has_explicit_ceiling_exit_intent(message):
+        if (
+            _has_ceiling_intent(message)
+            and not _has_explicit_ceiling_exit_intent(message)
+            and valid_filters.get("product_type") != "diffuser"
+        ):
             # Потолочные запросы закрепляем за grille indoor до явного выхода пользователя.
             valid_filters["product_type"] = "grille"
             if not valid_filters.get("location"):
@@ -2997,7 +3466,7 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                     session["active_filters"][k] = v
 
         for key, value in valid_filters.items():
-            if key != "product_type" and not key.startswith("grille_"):
+            if key != "product_type" and not key.startswith(("grille_", "diffuser_")):
                 session["active_filters"][key] = value
 
         if session.get("scenario_key") == "grille":

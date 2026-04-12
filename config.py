@@ -770,6 +770,78 @@ SLOT_GKL_REQUIRED_KEYS: frozenset[str] = frozenset({
 })
 
 
+DIFFUSER_STEPS: list[dict] = [
+    {
+        "step_id": "diffuser_type",
+        "question": "Какой тип диффузора нужен?",
+        "options": [
+            {"label": "Теневой / скрытого монтажа", "value": "shadow_hidden"},
+            {"label": "Дизайнерский", "value": "designer"},
+            {"label": "Перфорированный", "value": "perforated"},
+            {"label": "Универсальный", "value": "universal"},
+            {"label": "Вихревой", "value": "swirl"},
+            {"label": "Сопловый / струйный", "value": "nozzle"},
+            {"label": "Веерный / конический", "value": "fan"},
+            {"label": "Напольный", "value": "floor"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "diffuser_purpose",
+        "question": "Для чего нужен диффузор?",
+        "options": [
+            {"label": "Приточный", "value": "supply"},
+            {"label": "Вытяжной", "value": "exhaust"},
+            {"label": "Приточно-вытяжной", "value": "supply_exhaust"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "diffuser_install",
+        "question": "Где будет установлен диффузор?",
+        "condition": {"diffuser_type": "shadow_hidden"},
+        "options": [
+            {"label": "В потолок", "value": "ceiling"},
+            {"label": "В натяжной потолок", "value": "stretch_ceiling"},
+            {"label": "Скрытого монтажа", "value": "hidden"},
+            {"label": "В пол", "value": "floor"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "diffuser_form",
+        "question": "Какая форма нужна?",
+        "options": [
+            {"label": "Круглая", "value": "round"},
+            {"label": "Квадратная", "value": "square"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "diffuser_diameter",
+        "question": "Какой размер подключения / диаметр нужен?",
+        "options": [
+            {"label": "80 мм", "value": "80"},
+            {"label": "100 мм", "value": "100"},
+            {"label": "125 мм", "value": "125"},
+            {"label": "150 мм", "value": "150"},
+            {"label": "160 мм", "value": "160"},
+            {"label": "200 мм", "value": "200"},
+            {"label": "Другой / не знаю", "value": "unknown"},
+        ],
+    },
+    {
+        "step_id": "diffuser_adjustable",
+        "question": "Нужна ли регулировка потока?",
+        "options": [
+            {"label": "Да", "value": "yes"},
+            {"label": "Нет", "value": "no"},
+            {"label": "Не знаю", "value": "unknown"},
+        ],
+    },
+]
+
+
 SLOT_SERIES: dict[str, list[str]] = {
 
     "gkl":           ["PV", "TL", "VL-G", "HL", "PL35M", "PL50M", "VLL-G", "VLLS-G"],
@@ -940,24 +1012,7 @@ FUNNEL_SCENARIOS: dict[str, dict] = {
     "diffuser": {
         "label": "Диффузоры",
         "auto_filters": {},
-        "steps": [
-            {
-                "step_id": "location",
-                "question": "Где будет установлен диффузор?",
-                "options": [
-                    {"label": "Внутри помещения (потолок / стена)", "filter_value": "indoor"},
-                ],
-            },
-            {
-                "step_id": "size_group",
-                "question": "Какой размер диффузора?",
-                "options": [
-                    {"label": "Малый (до 600 мм)", "filter_value": "small"},
-                    {"label": "Большой (от 600 мм)", "filter_value": "large"},
-                    {"label": "Нужна консультация", "filter_value": ""},
-                ],
-            },
-        ],
+        "steps": [],
         "max_size_mm": 625,
     },
     # ── Корзины для кондиционеров ─────────────────────────────────────────────
