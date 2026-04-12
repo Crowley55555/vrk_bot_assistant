@@ -775,10 +775,8 @@ DIFFUSER_STEPS: list[dict] = [
         "step_id": "diffuser_purpose",
         "question": "Для чего нужен диффузор?",
         "options": [
-            {"label": "Приточный", "value": "supply"},
             {"label": "Вытяжной", "value": "exhaust"},
-            {"label": "Приточно-вытяжной", "value": "supply_exhaust"},
-            {"label": "Не знаю", "value": "unknown"},
+            {"label": "Приточно-вытяжной", "value": "unknown"},
         ],
     },
     {
