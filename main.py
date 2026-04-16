@@ -872,6 +872,133 @@ def _validate_product(meta: dict, active_filters: dict[str, str]) -> bool:
     return True
 
 
+def _result_identity(result: dict) -> str:
+    meta = result.get("metadata", {}) or {}
+    return str(
+        result.get("id")
+        or meta.get("url")
+        or meta.get("article")
+        or meta.get("name")
+        or ""
+    )
+
+
+def _merge_unique_results(*groups: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for group in groups:
+        for result in group:
+            rid = _result_identity(result)
+            if not rid or rid in seen:
+                continue
+            seen.add(rid)
+            merged.append(result)
+    return merged
+
+
+def _facade_meta_blob(meta: dict[str, Any]) -> str:
+    return " ".join(
+        str(meta.get(key, "") or "")
+        for key in ("name", "article", "category", "url", "raw_attrs_json")
+    ).lower()
+
+
+def _is_facade_outdoor_candidate(meta: dict[str, Any]) -> bool:
+    category = str(meta.get("category", "") or "").strip().lower()
+    if category == "reshetki-naruzhnye":
+        return True
+    blob = _facade_meta_blob(meta)
+    return any(token in blob for token in ("на фасад", "фасад", "наружн"))
+
+
+def _is_vrn_ur_result(meta: dict[str, Any]) -> bool:
+    return "врн-ур" in _facade_meta_blob(meta)
+
+
+def _is_vrn_r_result(meta: dict[str, Any]) -> bool:
+    blob = _facade_meta_blob(meta)
+    return "врн-р" in blob and "врн-ркдм" not in blob and "врн-ур" not in blob
+
+
+def _is_facade_embedded_regulated_path(answers: dict[str, Any] | None) -> bool:
+    answers = answers or {}
+    return (
+        (answers.get("facade_solution_type") or "").strip() == "standard"
+        and (answers.get("facade_mount_type") or "").strip() == "embedded"
+        and (answers.get("facade_regulated") or "").strip() == "regulated"
+        and (answers.get("facade_form") or "").strip() != "round"
+    )
+
+
+def _facade_embedded_regulated_query_hints(answers: dict[str, Any] | None) -> list[str]:
+    if not _is_facade_embedded_regulated_path(answers):
+        return []
+    size = (answers or {}).get("facade_size", "")
+    if size in ("over_2m2", "over_4m2"):
+        return ["наружная регулируемая решетка", "врн-ур", "усиленная", "большой проем"]
+    return ["наружная регулируемая решетка", "врн-р", "врн-ур"]
+
+
+def _recover_facade_embedded_regulated_results(
+    results: list[dict],
+    query: str,
+    active_filters: dict[str, str],
+    scenario: dict[str, Any],
+    subcats: list[str] | None,
+    answers: dict[str, Any] | None,
+    n_results: int,
+) -> list[dict]:
+    if not _is_facade_embedded_regulated_path(answers) or len(results) > 1:
+        return results
+    relaxed_filters = dict(active_filters)
+    relaxed_filters.pop("location", None)
+    recovered = _search_with_fallback(
+        query,
+        relaxed_filters,
+        scenario,
+        subcats,
+        n_results=max(12, n_results),
+        detail_branch="facade",
+    )
+    recovered = [
+        result for result in recovered
+        if _is_facade_outdoor_candidate((result.get("metadata", {}) or {}))
+    ]
+    if not recovered:
+        return results
+    return _merge_unique_results(results, recovered)
+
+
+def _rerank_facade_embedded_regulated_results(
+    results: list[dict],
+    answers: dict[str, Any] | None,
+) -> list[dict]:
+    if not _is_facade_embedded_regulated_path(answers) or not results:
+        return results
+    size = (answers or {}).get("facade_size", "")
+    large_size = size in ("over_2m2", "over_4m2")
+
+    def score(result: dict) -> tuple[int, int, int, float]:
+        meta = result.get("metadata", {}) or {}
+        dist = float(result.get("distance", 1.0) or 1.0)
+        outdoor_priority = 1 if _is_facade_outdoor_candidate(meta) else 0
+        series_priority = 0
+        if _is_vrn_ur_result(meta):
+            series_priority = 3 if large_size else 2
+        elif _is_vrn_r_result(meta):
+            series_priority = 2 if large_size else 3
+        exact_priority = 0
+        if str(meta.get("regulated", "") or "").strip() == "regulated":
+            exact_priority += 1
+        if str(meta.get("installation", "") or "").strip() == "embedded":
+            exact_priority += 1
+        if str(meta.get("material", "") or "").strip() == "aluminum":
+            exact_priority += 1
+        return (-outdoor_priority, -series_priority, -exact_priority, dist)
+
+    return sorted(results, key=score)
+
+
 def _search_with_fallback(
     query: str,
     active_filters: dict[str, str],
@@ -2768,7 +2895,18 @@ def _recommend_series(session_id: str) -> str:
     if branch == "facade":
         solution = answers.get("facade_solution_type", "standard")
         size = answers.get("facade_size", "")
-        if solution == "regulated":
+        facade_regulated = answers.get("facade_regulated", "")
+        mount_type = answers.get("facade_mount_type", "")
+        if (
+            solution == "standard"
+            and mount_type == "embedded"
+            and facade_regulated == "regulated"
+        ):
+            if size in ("over_2m2", "over_4m2"):
+                series = ["ВРН-УР", "ВРН-Р"]
+            else:
+                series = ["ВРН-Р", "ВРН-УР"]
+        elif solution == "regulated":
             series = FACADE_SERIES.get("regulated", [])
         elif solution == "service":
             series = FACADE_SERIES.get("service", [])
@@ -2847,6 +2985,7 @@ async def _detail_search(session_id: str) -> ChatResponse:
     """Выполняет поиск после завершения детальной ветки."""
     s = _get_session(session_id)
     indoor_query_additions: list[str] = []
+    facade_query_additions: list[str] = []
     if (
         s.get("detail_branch") == "slot"
         and (s.get("detail_answers") or {}).get("slot_mount") == "concealed"
@@ -2966,6 +3105,7 @@ async def _detail_search(session_id: str) -> ChatResponse:
             else:
                 s["active_filters"].pop("regulated", None)
             # allowed_subcats уже задан при входе в фасад (outdoor без инерционных) — не трогаем
+        facade_query_additions.extend(_facade_embedded_regulated_query_hints(answers))
 
     elif s.get("detail_branch") == "acoustic":
         # Акустические решётки: только подкатегория akusticheskie-reshetki и выбранный материал.
@@ -3115,6 +3255,8 @@ async def _detail_search(session_id: str) -> ChatResponse:
     query = _build_search_query(session_id)
     if indoor_query_additions:
         query += " " + " ".join(indoor_query_additions)
+    if facade_query_additions:
+        query += " " + " ".join(facade_query_additions)
     if recommendation:
         query += " " + recommendation.split(":")[1].strip() if ":" in recommendation else ""
 
@@ -3136,6 +3278,18 @@ async def _detail_search(session_id: str) -> ChatResponse:
         n_results=detail_n_results,
         detail_branch=s.get("detail_branch"),
     )
+    if s.get("detail_branch") == "facade":
+        facade_answers = s.get("detail_answers") or {}
+        results = _recover_facade_embedded_regulated_results(
+            results,
+            query,
+            s["active_filters"],
+            scenario,
+            subcats,
+            facade_answers,
+            detail_n_results,
+        )
+        results = _rerank_facade_embedded_regulated_results(results, facade_answers)
     ceiling_recovery_reason = ""
     if (
         s.get("detail_branch") == "indoor"

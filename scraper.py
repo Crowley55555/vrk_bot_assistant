@@ -246,6 +246,11 @@ def _build_filters(raw_attrs: dict[str, str], name: str, category: str | None) -
 
     loc_raw = raw_attrs.get("Место применения", "") or raw_attrs.get("Исполнение", "")
     filters["location"] = _normalize_location(loc_raw) if loc_raw else "unknown"
+    category_slug = (category or "").strip().lower()
+    if category_slug == "reshetki-naruzhnye" and filters["location"] != "outdoor":
+        # Для наружных решёток карточка иногда содержит общее «В стены»,
+        # но сама подкатегория однозначно относится к фасадному/наружному сценарию.
+        filters["location"] = "outdoor"
 
     # Регулируемая/Нерегулируемая — по характеристике с сайта; если не указано — считаем нерегулируемой
     regulated_raw = (
