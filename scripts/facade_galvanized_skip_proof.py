@@ -117,11 +117,11 @@ async def _aluminum_control_case() -> dict:
 async def _stainless_case() -> dict:
     transcript = await _walk_path(
         "facade-stainless-skip",
-        ["grille", "outdoor", "rectangular", "standard", "stainless_steel", "embedded", "over_2m2", "yes"],
+        ["grille", "outdoor", "rectangular", "standard", "stainless_steel", "over_2m2", "yes"],
     )
     replies = [step["reply"] for step in transcript]
     stainless_step = next(step for step in transcript if step["answer"] == "stainless_steel")
-    size_step = next(step for step in transcript if step["answer"] == "embedded")
+    size_step = transcript[transcript.index(stainless_step)]
     final_step = transcript[-1]
     size_values = [button["value"] for button in size_step["buttons"]]
     size_labels = [button["label"] for button in size_step["buttons"]]
@@ -135,6 +135,7 @@ async def _stainless_case() -> dict:
         "final_action": final_step["action"],
         "final_reply": final_step["reply"],
         "final_products": final_step["products"],
+        "auto_mount_type": size_step["session_snapshot"]["detail_answers"].get("facade_mount_type", ""),
         "regulated_question_seen": any(_mentions_regulated_question(reply) for reply in replies),
         "facade_regulated_in_detail_answers": "facade_regulated" in final_step["session_snapshot"]["detail_answers"],
         "regulated_in_active_filters": "regulated" in final_step["session_snapshot"]["active_filters"],
@@ -164,7 +165,7 @@ async def _galvanized_invalid_regulated_case() -> dict:
 async def _stainless_invalid_regulated_case() -> dict:
     transcript = await _walk_path(
         "facade-stainless-invalid-regulated",
-        ["grille", "outdoor", "rectangular", "standard", "stainless_steel", "embedded", "regulated"],
+        ["grille", "outdoor", "rectangular", "standard", "stainless_steel", "regulated"],
     )
     before_invalid = transcript[-2]
     after_invalid = transcript[-1]
@@ -183,12 +184,31 @@ async def _stainless_invalid_regulated_case() -> dict:
 async def _stainless_invalid_over4_case() -> dict:
     transcript = await _walk_path(
         "facade-stainless-invalid-over4",
-        ["grille", "outdoor", "rectangular", "standard", "stainless_steel", "embedded", "over_4m2"],
+        ["grille", "outdoor", "rectangular", "standard", "stainless_steel", "over_4m2"],
     )
     before_invalid = transcript[-2]
     after_invalid = transcript[-1]
     return {
         "case": "outdoor_stainless_invalid_over4m2",
+        "reply_before_invalid": before_invalid["reply"],
+        "reply_after_invalid": after_invalid["reply"],
+        "action_after_invalid": after_invalid["action"],
+        "detail_answers_before": before_invalid["session_snapshot"]["detail_answers"],
+        "detail_answers_after": after_invalid["session_snapshot"]["detail_answers"],
+        "active_filters_before": before_invalid["session_snapshot"]["active_filters"],
+        "active_filters_after": after_invalid["session_snapshot"]["active_filters"],
+    }
+
+
+async def _stainless_invalid_surface_case() -> dict:
+    transcript = await _walk_path(
+        "facade-stainless-invalid-surface",
+        ["grille", "outdoor", "rectangular", "standard", "stainless_steel", "surface"],
+    )
+    before_invalid = transcript[-2]
+    after_invalid = transcript[-1]
+    return {
+        "case": "outdoor_stainless_invalid_surface",
         "reply_before_invalid": before_invalid["reply"],
         "reply_after_invalid": after_invalid["reply"],
         "action_after_invalid": after_invalid["action"],
@@ -206,6 +226,7 @@ async def main() -> None:
         await _galvanized_invalid_regulated_case(),
         await _stainless_invalid_regulated_case(),
         await _stainless_invalid_over4_case(),
+        await _stainless_invalid_surface_case(),
         await _aluminum_control_case(),
     ]
     by_case = {item["case"]: item for item in report}
@@ -242,8 +263,8 @@ async def main() -> None:
         "Stainless path must continue with the next question",
     )
     _assert(
-        "встраиваемая или накладная" in by_case["outdoor_stainless_embedded"]["reply_after_stainless"].lower(),
-        "Stainless path should go to mount question right after material",
+        "какой примерный размер решетки" in by_case["outdoor_stainless_embedded"]["reply_after_stainless"].lower(),
+        "Stainless path should skip mount question and go straight to size",
     )
     _assert(
         "over_4m2" not in by_case["outdoor_stainless_embedded"]["size_step_values"],
@@ -256,6 +277,10 @@ async def main() -> None:
     _assert(
         not by_case["outdoor_stainless_embedded"]["regulated_question_seen"],
         "Stainless path must not ask regulated question",
+    )
+    _assert(
+        by_case["outdoor_stainless_embedded"]["auto_mount_type"] == "embedded",
+        "Stainless path must auto-fill embedded mount type",
     )
     _assert(
         not by_case["outdoor_stainless_embedded"]["facade_regulated_in_detail_answers"],
@@ -314,6 +339,20 @@ async def main() -> None:
         by_case["outdoor_stainless_invalid_over4m2"]["active_filters_before"]
         == by_case["outdoor_stainless_invalid_over4m2"]["active_filters_after"],
         "Manual over_4m2 for stainless must not change active_filters",
+    )
+    _assert(
+        by_case["outdoor_stainless_invalid_surface"]["action_after_invalid"] == "ask_question",
+        "Manual surface for stainless must be rejected",
+    )
+    _assert(
+        by_case["outdoor_stainless_invalid_surface"]["detail_answers_before"]
+        == by_case["outdoor_stainless_invalid_surface"]["detail_answers_after"],
+        "Manual surface for stainless must not change detail_answers",
+    )
+    _assert(
+        by_case["outdoor_stainless_invalid_surface"]["active_filters_before"]
+        == by_case["outdoor_stainless_invalid_surface"]["active_filters_after"],
+        "Manual surface for stainless must not change active_filters",
     )
     _assert(
         by_case["outdoor_aluminum_control"]["regulated_question_seen"],

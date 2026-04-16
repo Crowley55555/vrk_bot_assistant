@@ -2205,6 +2205,13 @@ def _next_detail_step(session_id: str) -> int | None:
         step_index = {step["step_id"]: i for i, step in enumerate(steps)}
         if (
             answers.get("facade_solution_type") == "standard"
+            and answers.get("facade_form") != "round"
+            and answers.get("facade_material") == "stainless_steel"
+            and "facade_mount_type" not in answers
+        ):
+            answers["facade_mount_type"] = "embedded"
+        if (
+            answers.get("facade_solution_type") == "standard"
             and answers.get("facade_mount_type") == "surface"
             and answers.get("facade_form") != "round"
             and answers.get("facade_material") not in ("galvanized", "stainless_steel")
@@ -3107,6 +3114,8 @@ async def _detail_search(session_id: str) -> ChatResponse:
             # Для стандартных фасадных решёток тип регулировки берём из detail-шага,
             # в том числе для накладного монтажа.
             mount_type = answers.get("facade_mount_type", "")
+            if mat == "stainless_steel":
+                mount_type = "embedded"
             if mount_type in ("embedded", "surface"):
                 s["active_filters"]["installation"] = mount_type
             else:
