@@ -161,6 +161,12 @@ def _detail_step_options(session: dict, step: dict) -> list[dict]:
     if step.get("step_id") == "acoustic_material":
         options = [o for o in options if (o.get("value") or "") in ("aluminum", "galvanized")]
     if (
+        session.get("detail_branch") == "facade"
+        and step.get("step_id") == "facade_size"
+        and ((session.get("detail_answers") or {}).get("facade_material") or "").strip() == "stainless_steel"
+    ):
+        options = [o for o in options if (o.get("value") or "") != "over_4m2"]
+    if (
         session.get("detail_branch") == "diffuser"
         and step.get("step_id") == "diffuser_form"
         and ((session.get("detail_answers") or {}).get("diffuser_type") or "").strip() == "fan"
@@ -2168,7 +2174,11 @@ def _detail_step_applicable(step: dict, answers: dict) -> bool:
     skip_if = step.get("applicable_when_not")
     if skip_if:
         for key, skip_val in skip_if.items():
-            if answers.get(key) == skip_val:
+            actual = answers.get(key)
+            if isinstance(skip_val, (list, tuple, set)):
+                if actual in skip_val:
+                    return False
+            elif actual == skip_val:
                 return False
     # Шаг показываем только когда condition выполнен (напр. facade_material только при form=round)
     cond = step.get("condition")
@@ -2197,6 +2207,7 @@ def _next_detail_step(session_id: str) -> int | None:
             answers.get("facade_solution_type") == "standard"
             and answers.get("facade_mount_type") == "surface"
             and answers.get("facade_form") != "round"
+            and answers.get("facade_material") not in ("galvanized", "stainless_steel")
             and "facade_regulated" not in answers
         ):
             regulated_idx = step_index.get("facade_regulated")
@@ -3100,7 +3111,9 @@ async def _detail_search(session_id: str) -> ChatResponse:
                 s["active_filters"]["installation"] = mount_type
             else:
                 s["active_filters"].pop("installation", None)
-            if regulated_val in ("regulated", "fixed"):
+            if mat in ("galvanized", "stainless_steel"):
+                s["active_filters"].pop("regulated", None)
+            elif regulated_val in ("regulated", "fixed"):
                 s["active_filters"]["regulated"] = regulated_val
             else:
                 s["active_filters"].pop("regulated", None)
@@ -3984,7 +3997,7 @@ async def process_message(request: ChatRequest) -> ChatResponse:
         if idx < len(steps):
             step = steps[idx]
             chosen = None
-            for opt in step.get("options", []):
+            for opt in _detail_step_options(session, step):
                 if opt.get("value") == message or opt["label"] == message:
                     chosen = opt.get("value", message)
                     break

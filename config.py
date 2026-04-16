@@ -400,7 +400,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Да, есть механическая вентиляция", "value": "yes"},
             {"label": "Нет, только декоративная функция", "value": "no"},
         ],
-        "applicable_when_not": {"facade_form": "round"},
+        "applicable_when_not": {"facade_form": "round", "facade_material": "stainless_steel"},
         "condition": {"facade_solution_type": "standard", "facade_size": "over_4m2"},
     },
     {
@@ -410,7 +410,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Важна цена", "value": "price"},
             {"label": "Важна жесткость конструкции", "value": "rigidity"},
         ],
-        "applicable_when_not": {"facade_form": "round"},
+        "applicable_when_not": {"facade_form": "round", "facade_material": "stainless_steel"},
         "condition": {
             "facade_solution_type": "standard",
             "facade_size": "over_4m2",
@@ -434,7 +434,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Да, усиление ламелей требуется", "value": "yes"},
             {"label": "Нет, усиление ламелей не требуется", "value": "no"},
         ],
-        "applicable_when_not": {"facade_form": "round"},
+        "applicable_when_not": {"facade_form": "round", "facade_material": "stainless_steel"},
         "condition": {
             "facade_solution_type": "standard",
             "facade_size": "over_4m2",
@@ -449,7 +449,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Нет, нерегулируемая", "value": "fixed"},
             {"label": "Да, регулируемая", "value": "regulated"},
         ],
-        "applicable_when_not": {"facade_form": "round"},
+        "applicable_when_not": {"facade_form": "round", "facade_material": ["galvanized", "stainless_steel"]},
         "condition": {"facade_solution_type": "standard"},
     },
     {
