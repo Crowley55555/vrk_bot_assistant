@@ -449,7 +449,7 @@ FACADE_STEPS: list[dict] = [
             {"label": "Нет, нерегулируемая", "value": "fixed"},
             {"label": "Да, регулируемая", "value": "regulated"},
         ],
-        "applicable_when_not": {"facade_form": "round", "facade_mount_type": "surface"},
+        "applicable_when_not": {"facade_form": "round"},
         "condition": {"facade_solution_type": "standard"},
     },
     {

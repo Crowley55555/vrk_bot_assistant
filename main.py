@@ -2064,6 +2064,17 @@ def _next_detail_step(session_id: str) -> int | None:
         return _next_diffuser_step(session_id)
     steps = _get_detail_steps(s["detail_branch"])
     answers = s["detail_answers"]
+    if s.get("detail_branch") == "facade":
+        step_index = {step["step_id"]: i for i, step in enumerate(steps)}
+        if (
+            answers.get("facade_solution_type") == "standard"
+            and answers.get("facade_mount_type") == "surface"
+            and answers.get("facade_form") != "round"
+            and "facade_regulated" not in answers
+        ):
+            regulated_idx = step_index.get("facade_regulated")
+            if regulated_idx is not None and _detail_step_applicable(steps[regulated_idx], answers):
+                return regulated_idx
     for i in range(s["detail_step_idx"], len(steps)):
         step = steps[i]
         if step["step_id"] not in answers and _detail_step_applicable(step, answers):
@@ -2943,15 +2954,14 @@ async def _detail_search(session_id: str) -> ChatResponse:
                 s["active_filters"]["material"] = mat
             else:
                 s["active_filters"].pop("material", None)
-            # Накладные: только накладные решётки, регулируемых не бывает
+            # Для стандартных фасадных решёток тип регулировки берём из detail-шага,
+            # в том числе для накладного монтажа.
             mount_type = answers.get("facade_mount_type", "")
             if mount_type in ("embedded", "surface"):
                 s["active_filters"]["installation"] = mount_type
             else:
                 s["active_filters"].pop("installation", None)
-            if mount_type == "surface":
-                s["active_filters"]["regulated"] = "fixed"
-            elif regulated_val in ("regulated", "fixed"):
+            if regulated_val in ("regulated", "fixed"):
                 s["active_filters"]["regulated"] = regulated_val
             else:
                 s["active_filters"].pop("regulated", None)
@@ -3826,7 +3836,19 @@ async def process_message(request: ChatRequest) -> ChatResponse:
                     break
             if chosen is not None:
                 session["detail_answers"][step["step_id"]] = chosen
-                session["detail_step_idx"] = idx + 1
+                next_idx = idx + 1
+                if (
+                    branch == "facade"
+                    and step.get("step_id") == "facade_regulated"
+                    and (session.get("detail_answers") or {}).get("facade_solution_type") == "standard"
+                    and (session.get("detail_answers") or {}).get("facade_mount_type") == "surface"
+                    and "facade_size" not in (session.get("detail_answers") or {})
+                ):
+                    for fallback_idx, fallback_step in enumerate(steps):
+                        if fallback_step.get("step_id") == "facade_size":
+                            next_idx = fallback_idx
+                            break
+                session["detail_step_idx"] = next_idx
                 return await _detail_ask(session_id)
 
     # ── Фаза: выбор категории ──

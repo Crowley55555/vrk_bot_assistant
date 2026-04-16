@@ -25,7 +25,7 @@
 - **active_filters:**
   - `form` — из facade_form (прямоугольные/квадратные/круглые); для инерционных сбрасывается;
   - `regulated` — из facade_regulated: regulated | fixed; для инерционных = fixed.
-- Исключение: накладная + регулируемая — поиск не выполняется, ответ «таких решёток нет».
+- Для стандартных фасадных решёток вопрос `facade_regulated` задаётся и после `facade_mount_type = surface`, и после `facade_mount_type = embedded`; только круглые пропускают этот шаг.
 
 ### 1.4 Ветка «В помещении» (detail_branch = indoor)
 Поиск после INDOOR_STEPS через **`_do_filtered_search`** (без отдельной подстановки фильтров из detail_answers в active_filters по коду).
